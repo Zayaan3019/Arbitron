@@ -27,19 +27,54 @@ const UNIVERSES = [
 ]
 
 function BackendStatus() {
-  const [status, setStatus] = useState<'checking' | 'ok' | 'error'>('checking')
+  const [status, setStatus] = useState<'checking' | 'warming' | 'ok' | 'error'>('checking')
 
   useEffect(() => {
     const base = (import.meta.env.VITE_API_URL ?? '').replace(/\/$/, '')
-    fetch(`${base}/health`, { signal: AbortSignal.timeout(5000) })
-      .then(r => setStatus(r.ok ? 'ok' : 'error'))
-      .catch(() => setStatus('error'))
+    let cancelled = false
+
+    // After 6s still checking → show "warming up" (Render free-tier cold start takes ~50s)
+    const warmTimer = setTimeout(() => {
+      if (!cancelled) setStatus('warming')
+    }, 6000)
+
+    const attempt = (retries: number) => {
+      const controller = new AbortController()
+      const t = setTimeout(() => controller.abort(), 55000)
+
+      fetch(`${base}/health`, { signal: controller.signal })
+        .then(r => {
+          clearTimeout(t)
+          if (!cancelled) setStatus(r.ok ? 'ok' : 'error')
+        })
+        .catch(() => {
+          clearTimeout(t)
+          if (!cancelled && retries > 0) {
+            setTimeout(() => attempt(retries - 1), 5000)
+          } else if (!cancelled) {
+            setStatus('error')
+          }
+        })
+    }
+
+    attempt(3)
+    return () => {
+      cancelled = true
+      clearTimeout(warmTimer)
+    }
   }, [])
 
   if (status === 'checking') return (
     <div className="flex items-center gap-1.5 text-[10px] text-slate-500">
       <span className="w-1.5 h-1.5 rounded-full bg-slate-600 animate-pulse" />
       Connecting…
+    </div>
+  )
+
+  if (status === 'warming') return (
+    <div className="flex items-center gap-1.5 text-[10px] text-yellow-500">
+      <span className="w-1.5 h-1.5 rounded-full bg-yellow-500 animate-pulse" />
+      Backend warming up…
     </div>
   )
 
@@ -50,10 +85,8 @@ function BackendStatus() {
         ? 'text-green-400 bg-green-950/40'
         : 'text-red-400 bg-red-950/40',
     )}>
-      {status === 'ok'
-        ? <Wifi size={10} />
-        : <WifiOff size={10} />}
-      {status === 'ok' ? 'Backend online' : 'Backend offline'}
+      {status === 'ok' ? <Wifi size={10} /> : <WifiOff size={10} />}
+      {status === 'ok' ? 'Backend online' : 'Backend offline — check Render env vars'}
     </div>
   )
 }
