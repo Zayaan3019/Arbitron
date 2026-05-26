@@ -252,13 +252,21 @@ function MessageBubble({ msg }: { msg: AgentChatMessage }) {
 
   if (msg.type === 'tool_result') {
     const ok = msg.content.startsWith('Done')
+    const result = msg.meta?.result as Record<string, unknown> | undefined
+    const errMsg: string | null = !ok
+      ? ((result?.message as string) || (typeof result?.error === 'string' ? result.error : null))
+      : null
     return (
-      <div className={clsx(
-        'flex items-center gap-1.5 pl-9 text-xs font-medium',
-        ok ? 'text-green-400' : 'text-red-400',
-      )}>
-        <span>{ok ? '✓' : '✗'}</span>
-        <span>{msg.content}</span>
+      <div className="pl-9 space-y-0.5">
+        <div className={clsx('flex items-center gap-1.5 text-xs font-medium', ok ? 'text-green-400' : 'text-red-400')}>
+          <span>{ok ? '✓' : '✗'}</span>
+          <span>{msg.content}</span>
+        </div>
+        {errMsg && (
+          <p className="text-[11px] text-red-300/70 leading-relaxed bg-red-950/30 rounded-lg px-2 py-1 border border-red-900/30">
+            {errMsg}
+          </p>
+        )}
       </div>
     )
   }
