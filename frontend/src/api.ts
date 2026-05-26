@@ -185,7 +185,7 @@ export function connectAgentStream(
 ): () => void {
   let wsBase: string
   if (_BACKEND) {
-    wsBase = _BACKEND.replace(/^https?/, (s) => (s === 'https' ? 'wss' : 'ws'))
+    wsBase = _BACKEND.replace(/^https?/, (s: string) => (s === 'https' ? 'wss' : 'ws'))
   } else {
     const protocol = location.protocol === 'https:' ? 'wss' : 'ws'
     wsBase = `${protocol}://${location.host}`
