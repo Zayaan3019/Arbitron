@@ -1,27 +1,42 @@
-/**
- * Agent chat page — send research tasks, stream events from the ReAct loop.
- */
-
 import { useState, useRef, useEffect } from 'react'
-import { Send, Loader2, Trash2, Zap } from 'lucide-react'
+import { Send, Loader2, Trash2, Zap, Bot, Search, BarChart2, TrendingUp, ShieldCheck } from 'lucide-react'
 import clsx from 'clsx'
 import { api, connectAgentStream, AgentEvent } from '../api'
 import { useStore, nextId, AgentChatMessage } from '../store'
 
+// Human-readable names for agent tool calls
+const TOOL_LABELS: Record<string, string> = {
+  fetch_universe:    'Fetching stock list',
+  compute_factor:    'Computing signal',
+  evaluate_factor:   'Evaluating signal quality',
+  run_backtest:      'Running backtest simulation',
+  optimize_portfolio:'Optimizing portfolio weights',
+  compute_risk:      'Analyzing portfolio risk',
+  detect_regime:     'Detecting market regime',
+  predict_returns:   'Predicting returns',
+}
+
 const QUICK_TASKS = [
-  'Screen momentum and volatility factors in SP500 from 2021–2024',
-  'Run a full quant pipeline: evaluate all factors, backtest top 3, optimise portfolio',
-  'Detect the current market regime and recommend factor tilts',
-  'Compare momentum_12_1 vs rsi_contrarian in the TECH universe',
+  { icon: Search,     label: 'Find the best momentum signal in tech stocks from 2021–2024',           hint: 'Discovers which momentum factor predicts returns best' },
+  { icon: TrendingUp, label: 'Run a full backtest of the top 3 factors and rank them by Sharpe ratio', hint: 'Compares strategies side by side' },
+  { icon: BarChart2,  label: 'Build an optimal portfolio from S&P 500 stocks and show the allocation', hint: 'Runs portfolio optimization for you' },
+  { icon: ShieldCheck,label: 'What is the current market regime and what does it mean for my strategy?', hint: 'Detects bull/bear signals and gives advice' },
 ]
 
-export default function AgentPage() {
-  const [input, setInput]   = useState('')
-  const bottomRef           = useRef<HTMLDivElement>(null)
-  const disconnectRef       = useRef<(() => void) | null>(null)
+function friendlyError(err: unknown): string {
+  const msg = String(err)
+  if (msg.includes('Failed to fetch') || msg.toLowerCase().includes('network')) {
+    return 'Cannot reach the backend server. Check that VITE_API_URL is set in your Vercel environment variables and the Render service is running.'
+  }
+  return msg.replace(/^Error:\s*/, '')
+}
 
-  const { agentMessages, agentRunning, appendAgentMessage, setAgentRunning, clearAgentMessages } =
-    useStore()
+export default function AgentPage() {
+  const [input, setInput] = useState('')
+  const bottomRef         = useRef<HTMLDivElement>(null)
+  const disconnectRef     = useRef<(() => void) | null>(null)
+
+  const { agentMessages, agentRunning, appendAgentMessage, setAgentRunning, clearAgentMessages } = useStore()
 
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: 'smooth' })
@@ -31,61 +46,44 @@ export default function AgentPage() {
     if (!task.trim() || agentRunning) return
     setInput('')
     setAgentRunning(true)
-
-    appendAgentMessage({
-      id: nextId(), type: 'user', content: task, timestamp: Date.now(),
-    })
+    appendAgentMessage({ id: nextId(), type: 'user', content: task, timestamp: Date.now() })
 
     try {
       const { session_id } = await api.agent.run(task)
-
       disconnectRef.current = connectAgentStream(
         session_id,
         (event: AgentEvent) => handleEvent(event),
         () => setAgentRunning(false),
       )
     } catch (err) {
-      appendAgentMessage({
-        id: nextId(), type: 'error',
-        content: `Failed to start agent: ${err}`,
-        timestamp: Date.now(),
-      })
+      appendAgentMessage({ id: nextId(), type: 'error', content: friendlyError(err), timestamp: Date.now() })
       setAgentRunning(false)
     }
   }
 
   function handleEvent(event: AgentEvent) {
     if (event.event_type === 'ping') return
-
     if (event.event_type === 'thinking') {
-      appendAgentMessage({
-        id: nextId(), type: 'thinking',
-        content: String(event.data ?? ''),
-        timestamp: Date.now(),
-      })
+      appendAgentMessage({ id: nextId(), type: 'thinking', content: String(event.data ?? ''), timestamp: Date.now() })
     } else if (event.event_type === 'tool_call') {
       const d = event.data as Record<string, unknown>
+      const toolName = String(d.tool ?? '')
       appendAgentMessage({
         id: nextId(), type: 'tool_call',
-        content: `→ ${d.tool}`,
-        timestamp: Date.now(),
-        meta: d as Record<string, unknown>,
+        content: TOOL_LABELS[toolName] ?? toolName,
+        timestamp: Date.now(), meta: d,
       })
     } else if (event.event_type === 'tool_result') {
       const d = event.data as Record<string, unknown>
       const ok = !(d.result as Record<string, unknown>)?.error
+      const toolName = String(d.tool ?? '')
       appendAgentMessage({
         id: nextId(), type: 'tool_result',
-        content: `${ok ? '✓' : '✗'} ${d.tool}`,
-        timestamp: Date.now(),
-        meta: d as Record<string, unknown>,
+        content: `${ok ? 'Done' : 'Failed'}: ${TOOL_LABELS[toolName] ?? toolName}`,
+        timestamp: Date.now(), meta: d,
       })
     } else if (event.event_type === 'text') {
-      appendAgentMessage({
-        id: nextId(), type: 'text',
-        content: String(event.data ?? ''),
-        timestamp: Date.now(),
-      })
+      appendAgentMessage({ id: nextId(), type: 'text', content: String(event.data ?? ''), timestamp: Date.now() })
     } else if (event.event_type === 'done' || event.event_type === 'error') {
       setAgentRunning(false)
     }
@@ -99,65 +97,87 @@ export default function AgentPage() {
   return (
     <div className="flex flex-col h-full">
       {/* Header */}
-      <div className="px-6 py-4 border-b border-surface-border flex items-center justify-between">
+      <div className="px-6 py-4 border-b border-surface-border bg-surface-card flex items-center justify-between">
         <div>
-          <h1 className="text-base font-semibold text-slate-100">Research Agent</h1>
-          <p className="text-xs text-slate-500">Claude-powered autonomous quant research loop</p>
+          <h1 className="text-sm font-bold text-slate-100">AI Research Assistant</h1>
+          <p className="text-xs text-slate-500 mt-0.5">
+            Describe what you want to research — the AI writes and runs the analysis for you
+          </p>
         </div>
-        <button
-          onClick={clearAgentMessages}
-          className="flex items-center gap-1.5 px-3 py-1.5 text-xs text-slate-400
-                     hover:text-slate-200 border border-surface-border rounded-lg
-                     hover:border-slate-600 transition-colors"
-        >
-          <Trash2 size={12} /> Clear
-        </button>
+        {agentMessages.length > 0 && (
+          <button
+            onClick={clearAgentMessages}
+            className="flex items-center gap-1.5 px-3 py-1.5 text-xs text-slate-400
+                       hover:text-slate-200 border border-surface-border rounded-lg
+                       hover:border-slate-600 transition-colors"
+          >
+            <Trash2 size={11} /> Clear chat
+          </button>
+        )}
       </div>
 
-      {/* Quick tasks */}
+      {/* Welcome / quick tasks */}
       {agentMessages.length === 0 && (
-        <div className="px-6 py-6">
-          <p className="text-xs text-slate-500 mb-3 uppercase tracking-wider">Quick start</p>
-          <div className="grid grid-cols-2 gap-2">
-            {QUICK_TASKS.map((t) => (
-              <button
-                key={t}
-                onClick={() => submit(t)}
-                className="text-left px-4 py-3 rounded-xl border border-surface-border
-                           bg-surface-card hover:border-brand-500/50 hover:bg-brand-500/5
-                           text-xs text-slate-300 transition-colors leading-relaxed"
-              >
-                <Zap size={12} className="inline text-brand-500 mr-1.5 mb-0.5" />
-                {t}
-              </button>
-            ))}
+        <div className="px-6 py-8 space-y-6">
+          <div className="flex items-start gap-3">
+            <div className="w-9 h-9 rounded-xl bg-brand-500/20 flex items-center justify-center flex-shrink-0 mt-0.5">
+              <Bot size={18} className="text-brand-400" />
+            </div>
+            <div>
+              <p className="text-sm font-semibold text-slate-200 mb-1">Hello! I'm your quant research AI.</p>
+              <p className="text-xs text-slate-400 leading-relaxed max-w-lg">
+                Tell me what you want to research in plain English. I'll automatically fetch market data,
+                compute signals, run backtests, and give you a clear summary — no coding needed.
+              </p>
+            </div>
+          </div>
+
+          <div>
+            <p className="text-xs text-slate-500 mb-3 font-medium uppercase tracking-wider">Try one of these</p>
+            <div className="grid grid-cols-2 gap-2">
+              {QUICK_TASKS.map((t) => (
+                <button
+                  key={t.label}
+                  onClick={() => submit(t.label)}
+                  className="text-left px-4 py-3 rounded-xl border border-surface-border
+                             bg-surface-card hover:border-brand-500/40 hover:bg-brand-500/5
+                             transition-colors space-y-1 group"
+                >
+                  <div className="flex items-center gap-2">
+                    <t.icon size={13} className="text-brand-400 flex-shrink-0" />
+                    <span className="text-xs text-slate-200 font-medium leading-snug">{t.label}</span>
+                  </div>
+                  <p className="text-[10px] text-slate-600 group-hover:text-slate-500 pl-5">{t.hint}</p>
+                </button>
+              ))}
+            </div>
           </div>
         </div>
       )}
 
       {/* Messages */}
-      <div className="flex-1 overflow-y-auto px-6 py-4 space-y-2">
+      <div className="flex-1 overflow-y-auto px-6 py-4 space-y-3">
         {agentMessages.map((m) => <MessageBubble key={m.id} msg={m} />)}
         {agentRunning && (
           <div className="flex items-center gap-2 text-slate-500 text-xs py-1">
             <Loader2 size={12} className="animate-spin" />
-            Agent is researching...
+            AI is working on your request…
           </div>
         )}
         <div ref={bottomRef} />
       </div>
 
-      {/* Input */}
-      <div className="px-6 py-4 border-t border-surface-border">
+      {/* Input bar */}
+      <div className="px-6 py-4 border-t border-surface-border bg-surface-card">
         <div className="flex gap-2">
           <input
             type="text"
             value={input}
             onChange={(e) => setInput(e.target.value)}
             onKeyDown={(e) => e.key === 'Enter' && !e.shiftKey && submit(input)}
-            placeholder="Describe a research task..."
+            placeholder="e.g. Which sector had the best momentum signal last year?"
             disabled={agentRunning}
-            className="flex-1 bg-surface-card border border-surface-border rounded-xl
+            className="flex-1 bg-surface-DEFAULT border border-surface-border rounded-xl
                        px-4 py-2.5 text-sm text-slate-200 placeholder:text-slate-600
                        focus:outline-none focus:border-brand-500/60 disabled:opacity-50"
           />
@@ -174,25 +194,25 @@ export default function AgentPage() {
               onClick={() => submit(input)}
               disabled={!input.trim()}
               className="px-4 py-2.5 rounded-xl bg-brand-500 text-white text-sm
-                         hover:bg-brand-600 disabled:opacity-40 transition-colors"
+                         hover:bg-brand-600 disabled:opacity-40 transition-colors flex items-center gap-2"
             >
-              <Send size={14} />
+              <Send size={14} /> Ask
             </button>
           )}
         </div>
+        <p className="text-[10px] text-slate-600 mt-2">
+          The AI can take 30–60 seconds to research a complex task. It will show each step it takes.
+        </p>
       </div>
     </div>
   )
 }
 
 function MessageBubble({ msg }: { msg: AgentChatMessage }) {
-  const [expanded, setExpanded] = useState(false)
-
   if (msg.type === 'user') {
     return (
       <div className="flex justify-end">
-        <div className="max-w-[70%] px-4 py-2.5 rounded-2xl rounded-tr-sm
-                        bg-brand-500 text-white text-sm leading-relaxed">
+        <div className="max-w-[75%] px-4 py-2.5 rounded-2xl rounded-tr-sm bg-brand-500 text-white text-sm leading-relaxed">
           {msg.content}
         </div>
       </div>
@@ -201,57 +221,56 @@ function MessageBubble({ msg }: { msg: AgentChatMessage }) {
 
   if (msg.type === 'text') {
     return (
-      <div className="max-w-[85%] px-4 py-3 rounded-2xl rounded-tl-sm
-                      bg-surface-card border border-surface-border
-                      text-sm text-slate-200 leading-relaxed whitespace-pre-wrap">
-        {msg.content}
+      <div className="flex gap-2.5">
+        <div className="w-6 h-6 rounded-lg bg-brand-500/20 flex items-center justify-center flex-shrink-0 mt-0.5">
+          <Bot size={12} className="text-brand-400" />
+        </div>
+        <div className="max-w-[85%] px-4 py-3 rounded-2xl rounded-tl-sm bg-surface-card
+                        border border-surface-border text-sm text-slate-200 leading-relaxed whitespace-pre-wrap">
+          {msg.content}
+        </div>
       </div>
     )
   }
 
   if (msg.type === 'thinking') {
     return (
-      <div className="text-xs text-slate-500 pl-1 italic leading-relaxed max-w-[85%] truncate">
-        {msg.content}
+      <div className="text-xs text-slate-600 pl-9 italic leading-relaxed max-w-[85%]">
+        💭 {msg.content}
       </div>
     )
   }
 
   if (msg.type === 'tool_call') {
     return (
-      <button
-        onClick={() => setExpanded(!expanded)}
-        className="flex items-start gap-2 text-xs text-left"
-      >
-        <span className="text-blue-400 font-mono">{msg.content}</span>
-        {msg.meta && (
-          <span className="text-slate-600 font-mono truncate max-w-xs">
-            {JSON.stringify(msg.meta.input).slice(0, 80)}
-          </span>
-        )}
-      </button>
+      <div className="flex items-center gap-2 pl-9 text-xs text-blue-400">
+        <Loader2 size={10} className="animate-spin flex-shrink-0" />
+        <span>{msg.content}…</span>
+      </div>
     )
   }
 
   if (msg.type === 'tool_result') {
-    const ok = msg.content.startsWith('✓')
+    const ok = msg.content.startsWith('Done')
     return (
-      <div
-        className={clsx(
-          'text-xs font-mono px-2 py-0.5 rounded inline-block',
-          ok ? 'text-green-400' : 'text-red-400'
-        )}
-      >
-        {msg.content}
+      <div className={clsx(
+        'flex items-center gap-1.5 pl-9 text-xs font-medium',
+        ok ? 'text-green-400' : 'text-red-400',
+      )}>
+        <span>{ok ? '✓' : '✗'}</span>
+        <span>{msg.content}</span>
       </div>
     )
   }
 
   if (msg.type === 'error') {
     return (
-      <div className="text-xs text-red-400 bg-red-950/30 border border-red-800/30
-                      rounded-lg px-3 py-2 font-mono">
-        {msg.content}
+      <div className="pl-9">
+        <div className="text-xs text-red-300 bg-red-950/40 border border-red-800/40
+                        rounded-xl px-4 py-3 leading-relaxed max-w-[85%]">
+          <p className="font-semibold mb-1">Something went wrong</p>
+          <p>{msg.content}</p>
+        </div>
       </div>
     )
   }

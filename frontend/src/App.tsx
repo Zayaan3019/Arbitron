@@ -1,68 +1,160 @@
 import { BrowserRouter, Routes, Route, NavLink } from 'react-router-dom'
-import { Bot, BarChart3, TrendingUp, ShieldAlert, Cpu } from 'lucide-react'
-import AgentPage from './pages/AgentPage'
-import FactorsPage from './pages/FactorsPage'
+import { useState, useEffect } from 'react'
+import { Bot, BarChart3, TrendingUp, ShieldAlert, Cpu, Wifi, WifiOff } from 'lucide-react'
+import AgentPage    from './pages/AgentPage'
+import FactorsPage  from './pages/FactorsPage'
 import BacktestPage from './pages/BacktestPage'
 import PortfolioPage from './pages/PortfolioPage'
-import RiskPage from './pages/RiskPage'
+import RiskPage     from './pages/RiskPage'
+import { useStore } from './store'
 import clsx from 'clsx'
 
 const NAV = [
-  { to: '/',          icon: Bot,        label: 'Agent'     },
-  { to: '/factors',   icon: BarChart3,  label: 'Factors'   },
-  { to: '/backtest',  icon: TrendingUp, label: 'Backtest'  },
-  { to: '/portfolio', icon: Cpu,        label: 'Portfolio' },
-  { to: '/risk',      icon: ShieldAlert,label: 'Risk'      },
+  { to: '/',          icon: Bot,        label: 'AI Agent',    desc: 'Chat to research stocks' },
+  { to: '/factors',   icon: BarChart3,  label: 'Factors',     desc: 'Test what predicts returns' },
+  { to: '/backtest',  icon: TrendingUp, label: 'Backtest',    desc: 'Replay a strategy in history' },
+  { to: '/portfolio', icon: Cpu,        label: 'Portfolio',   desc: 'Find your optimal mix' },
+  { to: '/risk',      icon: ShieldAlert,label: 'Risk',        desc: 'Measure your downside' },
 ]
 
+const UNIVERSES = [
+  { value: 'SP500',      label: 'S&P 500 (default)'   },
+  { value: 'Technology', label: 'Technology'           },
+  { value: 'Healthcare', label: 'Healthcare'           },
+  { value: 'Financials', label: 'Financials'           },
+  { value: 'Energy',     label: 'Energy'               },
+  { value: 'ConsumerDisc', label: 'Consumer'           },
+]
+
+function BackendStatus() {
+  const [status, setStatus] = useState<'checking' | 'ok' | 'error'>('checking')
+
+  useEffect(() => {
+    const base = (import.meta.env.VITE_API_URL ?? '').replace(/\/$/, '')
+    fetch(`${base}/health`, { signal: AbortSignal.timeout(5000) })
+      .then(r => setStatus(r.ok ? 'ok' : 'error'))
+      .catch(() => setStatus('error'))
+  }, [])
+
+  if (status === 'checking') return (
+    <div className="flex items-center gap-1.5 text-[10px] text-slate-500">
+      <span className="w-1.5 h-1.5 rounded-full bg-slate-600 animate-pulse" />
+      Connecting…
+    </div>
+  )
+
+  return (
+    <div className={clsx(
+      'flex items-center gap-1.5 text-[10px] font-medium px-2 py-1 rounded-md',
+      status === 'ok'
+        ? 'text-green-400 bg-green-950/40'
+        : 'text-red-400 bg-red-950/40',
+    )}>
+      {status === 'ok'
+        ? <Wifi size={10} />
+        : <WifiOff size={10} />}
+      {status === 'ok' ? 'Backend online' : 'Backend offline'}
+    </div>
+  )
+}
+
 export default function App() {
+  const { universe, startDate, endDate, setUniverse, setDateRange } = useStore()
+
   return (
     <BrowserRouter>
       <div className="flex h-full">
-        {/* Sidebar */}
-        <aside className="w-56 flex-shrink-0 flex flex-col bg-surface-card border-r border-surface-border">
+        {/* ── Sidebar ── */}
+        <aside className="w-60 flex-shrink-0 flex flex-col bg-surface-card border-r border-surface-border">
+
           {/* Logo */}
-          <div className="px-5 py-5 border-b border-surface-border">
-            <div className="flex items-center gap-2">
-              <div className="w-7 h-7 rounded-lg bg-brand-500 flex items-center justify-center">
-                <Bot size={16} className="text-white" />
+          <div className="px-4 py-4 border-b border-surface-border">
+            <div className="flex items-center gap-2.5">
+              <div className="w-8 h-8 rounded-xl bg-brand-500 flex items-center justify-center shadow-lg shadow-brand-500/30">
+                <Bot size={17} className="text-white" />
               </div>
-              <span className="text-sm font-bold tracking-tight text-slate-100">
-                ARBITRON
-              </span>
+              <div>
+                <p className="text-sm font-bold tracking-tight text-slate-100">ARBITRON</p>
+                <p className="text-[10px] text-slate-500 leading-none mt-0.5">Quant Research Platform</p>
+              </div>
             </div>
-            <p className="text-xs text-slate-500 mt-1">Autonomous Quant Research</p>
           </div>
 
           {/* Nav */}
-          <nav className="flex-1 py-4 px-2 space-y-0.5">
-            {NAV.map(({ to, icon: Icon, label }) => (
+          <nav className="py-3 px-2 space-y-0.5">
+            {NAV.map(({ to, icon: Icon, label, desc }) => (
               <NavLink
                 key={to}
                 to={to}
                 end={to === '/'}
                 className={({ isActive }) =>
                   clsx(
-                    'flex items-center gap-3 px-3 py-2 rounded-lg text-sm transition-colors',
+                    'flex items-center gap-3 px-3 py-2.5 rounded-xl transition-colors group',
                     isActive
-                      ? 'bg-brand-500/20 text-brand-500 font-medium'
-                      : 'text-slate-400 hover:text-slate-200 hover:bg-white/5'
+                      ? 'bg-brand-500/15 text-brand-400 border border-brand-500/20'
+                      : 'text-slate-400 hover:text-slate-200 hover:bg-white/5 border border-transparent',
                   )
                 }
               >
-                <Icon size={16} />
-                {label}
+                <Icon size={15} className="flex-shrink-0" />
+                <div>
+                  <p className="text-xs font-semibold leading-none">{label}</p>
+                  <p className="text-[10px] text-slate-600 mt-0.5 group-hover:text-slate-500 leading-none">{desc}</p>
+                </div>
               </NavLink>
             ))}
           </nav>
 
-          <div className="px-4 py-3 border-t border-surface-border">
-            <p className="text-[10px] text-slate-600 font-mono">v0.1.0 · claude-opus-4-5</p>
+          {/* Global settings */}
+          <div className="mx-3 mt-1 p-3 rounded-xl bg-surface-DEFAULT border border-surface-border space-y-3">
+            <p className="text-[10px] text-slate-400 font-semibold uppercase tracking-wider">
+              Settings — shared across all pages
+            </p>
+
+            <div>
+              <label className="text-[10px] text-slate-500 block mb-1.5">Stock Universe</label>
+              <select
+                value={universe}
+                onChange={(e) => setUniverse(e.target.value)}
+                className="w-full bg-surface-card border border-surface-border text-xs text-slate-300
+                           rounded-lg px-2 py-1.5 focus:outline-none focus:border-brand-500/60"
+              >
+                {UNIVERSES.map((u) => (
+                  <option key={u.value} value={u.value}>{u.label}</option>
+                ))}
+              </select>
+            </div>
+
+            <div>
+              <label className="text-[10px] text-slate-500 block mb-1.5">Date Range</label>
+              <div className="space-y-1">
+                <input
+                  type="date" value={startDate}
+                  onChange={(e) => setDateRange(e.target.value, endDate)}
+                  className="w-full bg-surface-card border border-surface-border text-xs text-slate-300
+                             rounded-lg px-2 py-1.5 focus:outline-none focus:border-brand-500/60"
+                />
+                <input
+                  type="date" value={endDate}
+                  onChange={(e) => setDateRange(startDate, e.target.value)}
+                  className="w-full bg-surface-card border border-surface-border text-xs text-slate-300
+                             rounded-lg px-2 py-1.5 focus:outline-none focus:border-brand-500/60"
+                />
+              </div>
+            </div>
+          </div>
+
+          <div className="flex-1" />
+
+          {/* Footer */}
+          <div className="px-4 py-3 border-t border-surface-border space-y-2">
+            <BackendStatus />
+            <p className="text-[10px] text-slate-600">v0.1.0 · Groq · Llama 3.3 70B</p>
           </div>
         </aside>
 
-        {/* Main */}
-        <main className="flex-1 overflow-y-auto">
+        {/* ── Main ── */}
+        <main className="flex-1 overflow-y-auto bg-surface-DEFAULT">
           <Routes>
             <Route path="/"          element={<AgentPage />} />
             <Route path="/factors"   element={<FactorsPage />} />
