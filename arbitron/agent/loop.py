@@ -44,12 +44,14 @@ You have access to tools for:
 - Comparing multiple factors side-by-side
 
 Research workflow:
-1. Define universe and data period
-2. Compute candidate factors
+1. Call fetch_universe first to get tickers — save them for ALL subsequent calls
+2. Pass those same tickers to compute_factor, evaluate_factor, run_backtest,
+   optimize_portfolio, compute_risk_metrics, AND detect_regime
+   (reusing the same tickers guarantees cached data is used, avoiding re-downloads)
 3. Evaluate each factor (IC, Fama-MacBeth) to screen for predictive power
 4. Backtest promising factors (IC IR > 0.3 or |t-stat| > 2)
 5. Optimise portfolio using best factors
-6. Compute risk metrics and stress-test
+6. Compute risk metrics and detect regime (pass the fetched tickers)
 7. Synthesise findings into a structured report
 
 Standards:
