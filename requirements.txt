@@ -1,0 +1,21 @@
+# Core quant
+numpy>=1.26
+pandas>=2.1
+scipy>=1.11
+scikit-learn>=1.4
+pyarrow>=15.0
+
+# LLM agent (Groq free tier via OpenAI-compatible API)
+openai>=1.40
+
+# Market data
+yfinance>=0.2.40
+
+# API
+fastapi>=0.115
+uvicorn[standard]>=0.30
+websockets>=12.0
+pydantic>=2.6
+
+# Local .env loading
+python-dotenv>=1.0

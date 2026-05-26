@@ -1,0 +1,35 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+*.egg
+
+# Cache and data
+.cache/
+*.parquet
+
+# Environment
+.env
+*.env.local
+
+# Frontend
+frontend/node_modules/
+frontend/dist/
+
+# Temp debug logs from dev session
+uvicorn_*.txt
+vite_*.txt
+
+# IDE
+.vscode/
+.idea/
+*.suo
+*.ntvs*
+
+# OS
+.DS_Store
+Thumbs.db
