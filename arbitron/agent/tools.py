@@ -202,17 +202,21 @@ TOOL_SCHEMAS = [
             "name": "detect_regime",
             "description": (
                 "Detect the current market regime (Bull/Bear) using a Hidden Markov Model. "
-                "Returns regime label, probability, and historical regime statistics."
+                "Returns regime label, probability, and historical regime statistics. "
+                "Pass the same tickers you already fetched so cached data is reused."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "benchmark_ticker": {
-                        "type": "string",
-                        "description": "Benchmark ticker for regime detection (e.g. 'SPY' or 'AAPL').",
-                        "default": "SPY",
+                    "tickers": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": (
+                            "Stock tickers to use as market proxy for regime detection. "
+                            "Pass the same tickers from your fetch_universe call to reuse cached data."
+                        ),
                     },
-                    "start_date": {"type": "string", "default": "2015-01-01"},
+                    "start_date": {"type": "string", "default": "2018-01-01"},
                 },
             },
         },
@@ -472,20 +476,17 @@ def _tool_compute_risk(inp: dict, cache_dir: str) -> dict:
 
 
 def _tool_detect_regime(inp: dict, cache_dir: str) -> dict:
-    from arbitron.data.market import MarketData
+    from arbitron.data.market import MarketData, DEFAULT_UNIVERSE
     from arbitron.models.regime import build_regime_detector
 
-    md       = _md(cache_dir)
-    ticker   = inp.get("benchmark_ticker", "SPY")
-    start    = inp.get("start_date", "2015-01-01")
+    md    = _md(cache_dir)
+    start = inp.get("start_date", "2018-01-01")  # consistent with all other tools
 
-    # SPY may not be available in some caches — use default universe proxy
-    try:
-        prices  = md.get_prices([ticker], start=start)
-        returns = prices.pct_change().dropna()[ticker]
-    except Exception:
-        prices  = md.get_prices(["AAPL", "MSFT", "GOOGL"], start=start)
-        returns = prices.pct_change().dropna().mean(axis=1)
+    # Prefer tickers supplied by caller (already cached from fetch_universe).
+    # Fall back to a slice of DEFAULT_UNIVERSE (same start/end=None as other tools).
+    tickers = inp.get("tickers") or DEFAULT_UNIVERSE[:15]
+    prices  = md.get_prices(tickers, start=start, end=None)
+    returns = prices.pct_change().dropna().mean(axis=1)
 
     detector = build_regime_detector(use_hmm=True)
     detector.fit(returns)
