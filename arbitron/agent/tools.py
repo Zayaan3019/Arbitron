@@ -310,7 +310,11 @@ def _tool_compute_factor(inp: dict, cache_dir: str) -> dict:
     start   = inp.get("start_date", "2018-01-01")
     end     = inp.get("end_date")
 
-    prices = md.get_prices(tickers, start=start, end=end)
+    # Always fetch to today (end=None) for maximum cache reuse across tool calls,
+    # then slice to the requested end date if one was specified.
+    prices = md.get_prices(tickers, start=start, end=None)
+    if end:
+        prices = prices[prices.index <= pd.Timestamp(end)]
     factor = compute_factor(fname, prices)
     factor_z = cross_section_zscore(factor)
 
@@ -344,7 +348,9 @@ def _tool_evaluate_factor(inp: dict, cache_dir: str) -> dict:
     start   = inp.get("start_date", "2018-01-01")
     end     = inp.get("end_date")
 
-    prices = md.get_prices(tickers, start=start, end=end)
+    prices = md.get_prices(tickers, start=start, end=None)
+    if end:
+        prices = prices[prices.index <= pd.Timestamp(end)]
     factor = compute_factor(fname, prices)
     result = factor_summary(fname, factor, prices, horizon)
 
@@ -363,7 +369,9 @@ def _tool_run_backtest(inp: dict, cache_dir: str) -> dict:
     end     = inp.get("end_date")
     tc_bps  = float(inp.get("transaction_cost_bps", 10))
 
-    prices = md.get_prices(tickers, start=start, end=end)
+    prices = md.get_prices(tickers, start=start, end=None)
+    if end:
+        prices = prices[prices.index <= pd.Timestamp(end)]
     factor = compute_factor(fname, prices)
 
     cfg = BacktestConfig(
@@ -439,7 +447,9 @@ def _tool_compute_risk(inp: dict, cache_dir: str) -> dict:
     start   = inp.get("start_date", "2018-01-01")
     end     = inp.get("end_date")
 
-    returns = md.get_returns(tickers, start=start, end=end)
+    returns = md.get_returns(tickers, start=start, end=None)
+    if end:
+        returns = returns[returns.index <= pd.Timestamp(end)]
     mkt_ret = returns.mean(axis=1)
 
     if weights_inp:
