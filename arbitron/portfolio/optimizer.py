@@ -103,14 +103,41 @@ def _portfolio_vol(w: np.ndarray, cov: np.ndarray) -> float:
     return float(np.sqrt(max(_portfolio_variance(w, cov), 0)))
 
 
-def _long_only_constraints(n: int) -> list[dict]:
-    return [
-        {"type": "eq", "fun": lambda w: np.sum(w) - 1.0},
-    ]
+def _finalise_weights(
+    w:         np.ndarray,
+    tickers:   list[str],
+    long_only: bool,
+) -> pd.Series:
+    """
+    Clean up a raw optimiser solution into a valid weight vector.
 
+    Two rules, both of which the previous code broke:
 
-def _long_only_bounds(n: int) -> list[tuple[float, float]]:
-    return [(0.0, 1.0)] * n
+    1. **Clip only when long_only.**  `np.clip(w, 0, None)` used to run
+       unconditionally, so a long-short solution had its entire short leg
+       zeroed — turning a dollar-neutral book into a levered long one.
+    2. **Always renormalise.**  Clipping (or any numerical drift in SLSQP)
+       breaks the budget constraint.  Without renormalising, weights summed
+       to 1.4385 on a real long-short run and every downstream return,
+       volatility and Sharpe was scaled by that number.
+
+    Post-condition: ``abs(w.sum() - 1) < 1e-9``.
+    """
+    w = np.asarray(w, dtype=float).copy()
+    w[~np.isfinite(w)] = 0.0
+
+    if long_only:
+        w = np.clip(w, 0.0, None)
+
+    total = w.sum()
+    if not np.isfinite(total) or abs(total) < 1e-12:
+        # Degenerate solution (e.g. a long-short book that netted to zero
+        # after clipping).  Equal weight is the honest fallback.
+        w = np.ones(len(w)) / max(len(w), 1)
+    else:
+        w = w / total
+
+    return pd.Series(w, index=tickers)
 
 
 # ---------------------------------------------------------------------------
@@ -152,11 +179,8 @@ def min_variance_portfolio(
         options={"maxiter": 1000, "ftol": 1e-10},
     )
 
-    if not result.success:
-        # Fallback: equal weight
-        return pd.Series(1 / n, index=tickers)
-
-    return pd.Series(result.x, index=tickers)
+    w_final = result.x if result.success else np.ones(n) / n
+    return _finalise_weights(w_final, tickers, long_only)
 
 
 def max_sharpe_portfolio(
@@ -217,7 +241,7 @@ def max_sharpe_portfolio(
     )
 
     w_final = result.x if result.success else w0
-    return pd.Series(np.clip(w_final, 0, None), index=tickers)
+    return _finalise_weights(w_final, tickers, long_only)
 
 
 def risk_parity_portfolio(
@@ -231,57 +255,102 @@ def risk_parity_portfolio(
       RC_i = w_i * (Σw)_i / w'Σw = 1/N  for all i
 
     This is more robust than MVO when expected returns are unreliable.
+
+    Note on the solver: an analytic Jacobian used to be supplied here, but it
+    was a self-described "simplified approximation" and was simply wrong.
+    SLSQP trusts the Jacobian it is given, so it converged to a non-ERC point
+    and reported ``success = True`` while doing it.  We now let SLSQP
+    finite-difference the true gradient, then polish with the standard ERC
+    fixed-point iteration, which converges monotonically for a PSD covariance.
+    ERC is only defined for strictly positive weights, so this optimiser is
+    long-only by construction.
+
+    Post-condition: weights sum to 1 and every component risk contribution is
+    within 1e-4 of `target_risk`.
     """
     tickers = list(cov_matrix.index)
     n   = len(tickers)
     cov = cov_matrix.values.astype(float)
 
+    # Ensure PSD — a negative eigenvalue makes the risk contributions
+    # meaningless and the fixed point non-convergent.
+    eigvals = np.linalg.eigvalsh(cov)
+    if eigvals.min() < 0:
+        cov = cov + (-eigvals.min() + 1e-12) * np.eye(n)
+
     if target_risk is None:
         target_risk = np.ones(n) / n   # equal risk contribution
+    target_risk = np.asarray(target_risk, dtype=float)
+    target_risk = target_risk / target_risk.sum()
 
     def erc_objective(w):
         w = np.maximum(w, 1e-10)
-        portfolio_vol = np.sqrt(w @ cov @ w)
+        portfolio_vol = np.sqrt(max(w @ cov @ w, 1e-300))
         mrc = cov @ w / portfolio_vol   # Marginal Risk Contribution
         rc  = w * mrc                   # Risk Contribution
         rc_pct = rc / rc.sum()
         return float(np.sum((rc_pct - target_risk) ** 2))
 
-    def erc_gradient(w):
-        w = np.maximum(w, 1e-10)
-        port_var = float(w @ cov @ w)
-        port_vol = np.sqrt(port_var)
-        mrc      = cov @ w / port_vol
-        rc       = w * mrc
-        rc_sum   = rc.sum()
-        rc_pct   = rc / rc_sum
-
-        # Gradient of sum((rc_pct - target)**2) w.r.t. w
-        d_obj = 2 * (rc_pct - target_risk)
-        # Chain rule (simplified first-order approximation)
-        grad = np.zeros(n)
-        for i in range(n):
-            grad[i] = d_obj[i] * (mrc[i] * rc_sum - rc[i] * mrc.sum()) / (rc_sum ** 2)
-        return grad
-
     w0 = np.ones(n) / n
     constraints = [{"type": "eq", "fun": lambda w: np.sum(w) - 1.0}]
-    bounds = [(1e-4, 1.0)] * n
+    bounds = [(1e-6, 1.0)] * n
 
     result = minimize(
         fun=erc_objective,
         x0=w0,
-        jac=erc_gradient,
-        method="SLSQP",
+        method="SLSQP",             # no jac= — finite differences are correct
         bounds=bounds,
         constraints=constraints,
         options={"maxiter": 2000, "ftol": 1e-14},
     )
 
-    w = result.x if result.success else w0
-    w = np.maximum(w, 0)
-    w /= w.sum()
-    return pd.Series(w, index=tickers)
+    w = np.asarray(result.x if result.success else w0, dtype=float)
+    w = _erc_polish(w, cov, target_risk, erc_objective)
+    return _finalise_weights(w, tickers, long_only=True)
+
+
+def _erc_polish(
+    w:           np.ndarray,
+    cov:         np.ndarray,
+    target_risk: np.ndarray,
+    objective,
+    max_iter:    int = 1000,
+    tol:         float = 1e-14,
+) -> np.ndarray:
+    """
+    Polish an ERC solution with the damped multiplicative fixed point.
+
+    Solves ``w_i * (Sigma w)_i = target_i * w'Sigma w`` via the geometric
+    update ``w_i <- sqrt(w_i * target_i * sigma^2 / (Sigma w)_i)``.  The
+    square root damps the raw Spinu/Maillard update, which can cycle on
+    near-identity covariances.
+
+    The result is accepted **only if it lowers the objective**.  A polish
+    step that makes the answer worse is exactly the failure mode the deleted
+    analytic Jacobian had — silently returning a non-ERC point while
+    reporting success — so it is guarded rather than trusted.
+    """
+    w = np.maximum(np.asarray(w, dtype=float), 1e-12)
+    w = w / w.sum()
+    best, best_obj = w, objective(w)
+
+    for _ in range(max_iter):
+        sigma_w = cov @ w
+        if not np.all(np.isfinite(sigma_w)) or np.any(sigma_w <= 0):
+            break
+        scale = target_risk * float(w @ sigma_w) / (w * sigma_w)
+        w_new = w * np.sqrt(np.maximum(scale, 1e-300))
+        w_new = np.maximum(w_new, 1e-12)
+        w_new = w_new / w_new.sum()
+
+        obj_new = objective(w_new)
+        if obj_new < best_obj:
+            best, best_obj = w_new, obj_new
+        if np.max(np.abs(w_new - w)) < tol:
+            break
+        w = w_new
+
+    return best
 
 
 def mean_variance_frontier(

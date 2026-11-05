@@ -5,14 +5,19 @@ All factors return a (dates × tickers) DataFrame of raw factor values.
 Use `cross_section_zscore` or `cross_section_rank` to normalise before use.
 
 Factor naming convention:  {type}_{lookback}
-  e.g. mom_252_21  = 252-day minus 21-day price return (12-1 momentum)
-       rev_21      = 21-day reversal
-       vol_63      = 63-day realised volatility
+  e.g. momentum_252_21 = 252-day minus 21-day price return (12-1 momentum)
+       reversal_21     = 21-day reversal
+       volatility_63   = 63-day realised volatility
+
+Every factor in this module is reachable through `FACTOR_REGISTRY`; there is
+no unreachable factor code here.  Factors take a price panel that may contain
+genuine NaNs (pre-IPO, post-delisting) and must propagate them rather than
+inventing a value — `MarketData.get_prices` no longer back-fills.
 
 References:
-  - Asness, Moskowitz & Pedersen (2013) — momentum/value
-  - Ang, Hodrick, Xing & Zhang (2006)  — idiosyncratic volatility
+  - Asness, Moskowitz & Pedersen (2013) — momentum
   - RSI: Wilder (1978)
+  - MACD: Appel (1979)
 """
 
 from __future__ import annotations
@@ -26,7 +31,7 @@ import pandas as pd
 # ---------------------------------------------------------------------------
 
 def _pct_change(prices: pd.DataFrame) -> pd.DataFrame:
-    return prices.pct_change()
+    return prices.pct_change(fill_method=None)
 
 
 def cross_section_zscore(df: pd.DataFrame) -> pd.DataFrame:
@@ -96,54 +101,6 @@ def short_term_reversal(
     return -(prices / prices.shift(lookback) - 1)
 
 
-def residual_momentum(
-    prices:      pd.DataFrame,
-    market_ret:  pd.Series,
-    lookback:    int = 252,
-    skip:        int = 21,
-) -> pd.DataFrame:
-    """
-    Residual (idiosyncratic) momentum — Blitz, Huij & Martens (2011).
-
-    Computes raw 12-1 momentum then subtracts the market-beta-adjusted
-    systematic component, capturing pure stock-specific momentum.
-    """
-    returns = _pct_change(prices)
-    raw_mom = momentum(prices, lookback, skip)
-
-    # Roll a 36-month OLS to get beta, then compute residual return
-    residuals = pd.DataFrame(index=returns.index, columns=returns.columns, dtype=float)
-    roll_window = 252
-
-    for col in returns.columns:
-        stock_r = returns[col].dropna()
-        mkt_r   = market_ret.reindex(stock_r.index).dropna()
-        common  = stock_r.index.intersection(mkt_r.index)
-        if len(common) < roll_window // 2:
-            continue
-
-        y = stock_r.loc[common].values
-        x = mkt_r.loc[common].values
-
-        roll_beta = pd.Series(index=common, dtype=float)
-        for i in range(roll_window, len(common) + 1):
-            yi = y[max(0, i - roll_window): i]
-            xi = x[max(0, i - roll_window): i]
-            if xi.std() < 1e-10:
-                continue
-            b = np.cov(yi, xi)[0, 1] / (np.var(xi) + 1e-12)
-            roll_beta.iloc[min(i - 1, len(common) - 1)] = b
-
-        roll_beta = roll_beta.ffill().bfill()
-        alpha_ret = (returns[col].reindex(common) -
-                     roll_beta * market_ret.reindex(common))
-        residuals.loc[common, col] = alpha_ret.values
-
-    # Apply same formation window
-    cum_resid = residuals.shift(skip).rolling(lookback - skip).sum()
-    return cum_resid.where(raw_mom.notna())
-
-
 # ---------------------------------------------------------------------------
 # Volatility / risk factors
 # ---------------------------------------------------------------------------
@@ -160,48 +117,6 @@ def realised_volatility(
     ret   = _pct_change(prices)
     vol   = ret.rolling(lookback, min_periods=lookback // 2).std() * np.sqrt(252)
     return -vol   # low-vol anomaly: low vol stocks outperform
-
-
-def idiosyncratic_vol(
-    prices:     pd.DataFrame,
-    market_ret: pd.Series,
-    lookback:   int = 63,
-) -> pd.DataFrame:
-    """
-    Idiosyncratic (residual) volatility after removing market beta.
-
-    Ang et al. (2006) show stocks with high idiosyncratic vol earn
-    lower future returns — so the factor is negated.
-    """
-    returns = _pct_change(prices)
-    ivol    = pd.DataFrame(index=returns.index, columns=returns.columns, dtype=float)
-
-    for col in returns.columns:
-        stock_r = returns[col]
-        mkt_r   = market_ret.reindex(stock_r.index)
-
-        # Compute rolling OLS residuals
-        def _roll_resid(idx):
-            if len(idx) < lookback // 2:
-                return np.nan
-            y = stock_r.loc[idx].values
-            x = mkt_r.loc[idx].values
-            valid = ~(np.isnan(y) | np.isnan(x))
-            y, x = y[valid], x[valid]
-            if x.std() < 1e-10 or len(y) < 10:
-                return np.nan
-            b = np.cov(y, x)[0, 1] / np.var(x)
-            resid = y - b * x
-            return resid.std() * np.sqrt(252)
-
-        ivol_vals = [
-            _roll_resid(returns.index[max(0, i - lookback): i])
-            for i in range(lookback, len(returns) + 1)
-        ]
-        if ivol_vals:
-            ivol.iloc[lookback:, ivol.columns.get_loc(col)] = ivol_vals
-
-    return -ivol.astype(float)  # negate: low idiosyncratic vol is preferred
 
 
 # ---------------------------------------------------------------------------
@@ -300,42 +215,6 @@ def price_acceleration(
 
 
 # ---------------------------------------------------------------------------
-# Factor combination utilities
-# ---------------------------------------------------------------------------
-
-def composite_factor(
-    factors:  dict[str, pd.DataFrame],
-    weights:  Optional[dict[str, float]] = None,
-) -> pd.DataFrame:
-    """
-    Equal-weight or custom-weight composite of multiple factor DataFrames.
-
-    Each factor is first cross-sectionally z-scored, then blended.
-
-    Args:
-        factors: Dict of {name: factor_df}.
-        weights: Optional {name: weight}.  Default = equal weight.
-
-    Returns:
-        (dates × tickers) composite factor DataFrame.
-    """
-    from typing import Optional  # noqa
-
-    names = list(factors.keys())
-    if weights is None:
-        weights = {n: 1.0 / len(names) for n in names}
-
-    total_w = sum(weights[n] for n in names)
-    result  = None
-    for name in names:
-        z = cross_section_zscore(factors[name])
-        w = weights.get(name, 1.0) / total_w
-        result = z * w if result is None else result + z * w
-
-    return result
-
-
-# ---------------------------------------------------------------------------
 # Factor registry (name → callable)
 # ---------------------------------------------------------------------------
 
@@ -373,7 +252,3 @@ def compute_factor(
 def compute_all_factors(prices: pd.DataFrame) -> dict[str, pd.DataFrame]:
     """Compute every factor in the registry."""
     return {name: fn(prices) for name, fn in FACTOR_REGISTRY.items()}
-
-
-# make Optional available at module scope for composite_factor
-from typing import Optional  # noqa: E402

@@ -27,6 +27,69 @@ from scipy import stats
 
 
 # ---------------------------------------------------------------------------
+# Newey-West HAC machinery
+#
+# Every statistic in this module is computed on a DAILY series whose target
+# is an h-day OVERLAPPING forward return.  Consecutive observations share
+# h-1 days of the same realisation, so the iid standard error is too small by
+# roughly sqrt(h) — a factor of ~4.6 at the default 21-day horizon.  That is
+# the difference between "t = 4.6, publishable" and "t = 1.0, noise".
+#
+# The Bartlett kernel below is the textbook Newey-West (1987) estimator; only
+# the LAG CHOICE was ever wrong in this repo, so it is now derived from the
+# horizon rather than hard-coded.
+# ---------------------------------------------------------------------------
+
+def default_hac_lags(horizon: int) -> int:
+    """
+    Newey-West truncation lag implied by an `horizon`-day overlapping target.
+
+    Observations h-1 days apart still share a day of the target window, so
+    the autocovariance structure runs out to exactly h-1 lags.
+    """
+    return max(0, int(horizon) - 1)
+
+
+def newey_west_se(series: pd.Series, lags: int) -> float:
+    """
+    Newey-West HAC standard error of the MEAN of `series`.
+
+    Args:
+        series: Stationary series (IC by date, or Fama-MacBeth slope by date).
+        lags:   Bartlett truncation lag.  Use `default_hac_lags(horizon)`.
+
+    Returns:
+        The HAC standard error, or NaN if it cannot be computed.
+    """
+    s = pd.Series(series, dtype=float).replace([np.inf, -np.inf], np.nan).dropna()
+    n = len(s)
+    if n < 3:
+        return np.nan
+
+    lags = int(max(0, min(lags, n - 1)))
+    demeaned = (s - s.mean()).values
+
+    nw_var = float(np.dot(demeaned, demeaned) / n)          # lag 0
+    for lag in range(1, lags + 1):
+        w   = 1.0 - lag / (lags + 1.0)                       # Bartlett kernel
+        cov = float(np.dot(demeaned[lag:], demeaned[:-lag]) / n)
+        nw_var += 2.0 * w * cov
+
+    if not np.isfinite(nw_var) or nw_var <= 0:
+        return np.nan
+    return float(np.sqrt(nw_var / n))
+
+
+def _naive_se(series: pd.Series) -> float:
+    """iid standard error of the mean — reported only for comparison."""
+    s = pd.Series(series, dtype=float).replace([np.inf, -np.inf], np.nan).dropna()
+    if len(s) < 3:
+        return np.nan
+    sd = float(s.std())
+    return sd / np.sqrt(len(s)) if sd > 0 else np.nan
+
+
+# ---------------------------------------------------------------------------
 # Forward returns helper
 # ---------------------------------------------------------------------------
 
@@ -92,36 +155,61 @@ def information_coefficient(
     return pd.Series(ic_vals, index=common_dates, name="IC")
 
 
-def ic_stats(ic: pd.Series) -> dict[str, float]:
+def ic_stats(
+    ic: pd.Series,
+    horizon: int = 21,
+    newey_west_lags: Optional[int] = None,
+) -> dict[str, float]:
     """
     Summary statistics for an IC time series.
 
-    Returns:
-        ic_mean:    Mean IC.
-        ic_std:     Std of IC.
-        ic_ir:      IC / std(IC) * sqrt(252/rebalance_days) — annualised.
-        t_stat:     t-statistic testing H0: IC_mean = 0.
-        pct_pos:    Fraction of periods with IC > 0.
-        ann_ic_ir:  Annualised ICIR assuming monthly rebalancing.
-    """
-    ic = ic.dropna()
-    if len(ic) < 3:
-        return {k: np.nan for k in
-                ("ic_mean", "ic_std", "ic_ir", "t_stat", "pct_pos")}
+    The headline `t_stat` is **Newey-West HAC corrected**.  The IC series is
+    a daily cross-section against an `horizon`-day overlapping forward
+    return, so the iid standard error the previous version used was too
+    small by roughly sqrt(horizon) — it inflated the t-stat about 4.6x at
+    the default 21-day horizon and turned noise into "significance".  The
+    naive value is still reported, side by side, so the size of the
+    correction is visible rather than hidden.
 
-    ic_mean = ic.mean()
-    ic_std  = ic.std()
+    Args:
+        ic:      IC by date, from `information_coefficient`.
+        horizon: Forward-return horizon used to build the IC, in days.
+        newey_west_lags: Override the truncation lag.  Defaults to
+            `horizon - 1`, the true overlap length.
+
+    Returns:
+        ic_mean, ic_std, ic_ir, t_stat (HAC), t_stat_naive (iid),
+        hac_lags, se_hac, se_naive, pct_pos, n_periods.
+    """
+    keys = ("ic_mean", "ic_std", "ic_ir", "t_stat", "t_stat_naive",
+            "se_hac", "se_naive", "pct_pos")
+    ic = pd.Series(ic, dtype=float).replace([np.inf, -np.inf], np.nan).dropna()
+    if len(ic) < 3:
+        return {**{k: np.nan for k in keys},
+                "hac_lags": default_hac_lags(horizon), "n_periods": len(ic)}
+
+    lags = default_hac_lags(horizon) if newey_west_lags is None else int(newey_west_lags)
+
+    ic_mean = float(ic.mean())
+    ic_std  = float(ic.std())
     ic_ir   = ic_mean / ic_std if ic_std > 0 else np.nan
-    t_stat  = ic_mean / (ic_std / np.sqrt(len(ic))) if ic_std > 0 else np.nan
-    pct_pos = (ic > 0).mean()
+
+    se_hac   = newey_west_se(ic, lags)
+    se_naive = _naive_se(ic)
+    t_hac    = ic_mean / se_hac   if np.isfinite(se_hac)   and se_hac   > 0 else np.nan
+    t_naive  = ic_mean / se_naive if np.isfinite(se_naive) and se_naive > 0 else np.nan
 
     return {
-        "ic_mean":    round(ic_mean, 4),
-        "ic_std":     round(ic_std,  4),
-        "ic_ir":      round(ic_ir,   4),
-        "t_stat":     round(t_stat,  4),
-        "pct_pos":    round(pct_pos, 4),
-        "n_periods":  len(ic),
+        "ic_mean":      round(ic_mean, 4),
+        "ic_std":       round(ic_std,  4),
+        "ic_ir":        round(ic_ir,   4) if np.isfinite(ic_ir) else np.nan,
+        "t_stat":       round(t_hac,   4) if np.isfinite(t_hac) else np.nan,
+        "t_stat_naive": round(t_naive, 4) if np.isfinite(t_naive) else np.nan,
+        "se_hac":       round(se_hac,   6) if np.isfinite(se_hac)   else np.nan,
+        "se_naive":     round(se_naive, 6) if np.isfinite(se_naive) else np.nan,
+        "hac_lags":     int(min(lags, len(ic) - 1)),
+        "pct_pos":      round(float((ic > 0).mean()), 4),
+        "n_periods":    len(ic),
     }
 
 
@@ -133,7 +221,7 @@ def fama_macbeth(
     factor:       pd.DataFrame,
     returns:      pd.DataFrame,
     horizon:      int = 21,
-    newey_west_lags: int = 4,
+    newey_west_lags: Optional[int] = None,
 ) -> dict[str, float]:
     """
     Fama-MacBeth (1973) cross-sectional regression.
@@ -141,8 +229,10 @@ def fama_macbeth(
     Each period t: run OLS  r_{i,t+h} = α_t + β_t * f_{i,t} + ε_{i,t}
     Collect β_t series; test whether mean(β_t) ≠ 0.
 
-    Newey-West correction with `newey_west_lags` lags accounts for
-    serial correlation in estimated betas (from overlapping returns).
+    Newey-West correction accounts for the serial correlation the
+    overlapping h-day targets induce in the estimated betas.  `lags`
+    defaults to `horizon - 1` — the true overlap.  The old default of 4
+    against a 21-day horizon left most of the overlap uncorrected.
 
     Returns:
         gamma:         Mean cross-sectional slope (factor risk premium).
@@ -150,6 +240,7 @@ def fama_macbeth(
         t_stat_naive:  Naive t-stat (ignores serial correlation).
         p_value:       Two-sided p-value from NW t-stat.
         n_periods:     Number of cross-sections used.
+        hac_lags:      Truncation lag actually applied.
         r_squared_mean: Mean cross-sectional R².
     """
     fwd_ret = forward_returns(returns, horizon)
@@ -183,38 +274,36 @@ def fama_macbeth(
         except np.linalg.LinAlgError:
             continue
 
-    if len(betas) < 3:
-        return {k: np.nan for k in
-                ("gamma", "t_stat", "t_stat_naive", "p_value", "n_periods", "r_squared_mean")}
+    lags = default_hac_lags(horizon) if newey_west_lags is None else int(newey_west_lags)
 
-    beta_series = pd.Series(betas)
-    gamma       = beta_series.mean()
+    if len(betas) < 3:
+        return {**{k: np.nan for k in
+                   ("gamma", "t_stat", "t_stat_naive", "p_value", "r_squared_mean")},
+                "n_periods": len(betas), "hac_lags": lags}
+
+    beta_series = pd.Series(betas, dtype=float)
+    gamma       = float(beta_series.mean())
     n           = len(beta_series)
 
-    # Naive t-stat
-    se_naive = beta_series.std() / np.sqrt(n)
-    t_naive  = gamma / se_naive if se_naive > 0 else np.nan
+    se_naive = _naive_se(beta_series)
+    se_nw    = newey_west_se(beta_series, lags)
 
-    # Newey-West HAC variance
-    lags    = min(newey_west_lags, n - 1)
-    demeaned = (beta_series - gamma).values
-    nw_var  = np.dot(demeaned, demeaned) / n  # lag-0
-    for lag in range(1, lags + 1):
-        w    = 1.0 - lag / (lags + 1)   # Bartlett kernel
-        cov  = np.dot(demeaned[lag:], demeaned[:-lag]) / n
-        nw_var += 2 * w * cov
-    se_nw = np.sqrt(max(nw_var, 0) / n)
-    t_nw  = gamma / se_nw if se_nw > 0 else np.nan
+    t_naive = gamma / se_naive if np.isfinite(se_naive) and se_naive > 0 else np.nan
+    t_nw    = gamma / se_nw    if np.isfinite(se_nw)    and se_nw    > 0 else np.nan
 
-    p_value = 2 * (1 - stats.t.cdf(abs(t_nw), df=n - 1)) if not np.isnan(t_nw) else np.nan
+    p_value = (
+        2 * (1 - stats.t.cdf(abs(t_nw), df=n - 1))
+        if np.isfinite(t_nw) else np.nan
+    )
 
     return {
         "gamma":           round(gamma, 6),
-        "t_stat":          round(t_nw, 4),
-        "t_stat_naive":    round(t_naive, 4),
-        "p_value":         round(p_value, 4),
+        "t_stat":          round(t_nw, 4) if np.isfinite(t_nw) else np.nan,
+        "t_stat_naive":    round(t_naive, 4) if np.isfinite(t_naive) else np.nan,
+        "p_value":         round(p_value, 4) if np.isfinite(p_value) else np.nan,
         "n_periods":       n,
-        "r_squared_mean":  round(np.mean(r2s), 4) if r2s else np.nan,
+        "hac_lags":        int(min(lags, n - 1)),
+        "r_squared_mean":  round(float(np.mean(r2s)), 4) if r2s else np.nan,
     }
 
 
@@ -275,7 +364,7 @@ def factor_summary(
     fwd_ret = forward_returns(prices, horizon)
 
     ic     = information_coefficient(factor, fwd_ret)
-    ic_s   = ic_stats(ic)
+    ic_s   = ic_stats(ic, horizon=horizon)
     fm     = fama_macbeth(factor, prices, horizon)
     qrets  = quintile_returns(factor, prices, horizon)
 

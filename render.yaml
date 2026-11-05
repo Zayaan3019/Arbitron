@@ -6,11 +6,42 @@ services:
     plan: free
     rootDir: .
     buildCommand: pip install -r requirements.txt
-    startCommand: uvicorn api.main:app --host 0.0.0.0 --port $PORT
+    # Sync handlers do blocking network + multi-minute CPU work, so they run
+    # on the threadpool. Size it for that; the default 40 would let a handful
+    # of /api/lab/run calls starve everything else on a free-plan instance.
+    startCommand: uvicorn api.main:app --host 0.0.0.0 --port $PORT --timeout-keep-alive 75
+    healthCheckPath: /health
     envVars:
+      # --- Secrets: set these in the Render dashboard, never in this file ---
       - key: GROQ_API_KEY
-        sync: false          # set manually in Render dashboard
+        sync: false
+      # Shared secret clients send as the X-API-Key header. Generate with:
+      #   python -c "import secrets; print(secrets.token_urlsafe(32))"
+      - key: ARBITRON_API_KEY
+        sync: false
+
+      # --- Security posture ---
+      # With this true and ARBITRON_API_KEY unset the service fails closed
+      # (503) rather than silently serving the internet.
+      - key: ARBITRON_REQUIRE_API_KEY
+        value: "true"
+      # Real frontend origin. NOT "*" — that plus an open API is what let
+      # anyone on the internet spend the Groq key 25 iterations at a time.
+      # Change to your deployed Vercel URL; comma-separate for previews.
       - key: ARBITRON_CORS_ORIGIN
-        value: "*"
+        value: "https://arbitron.vercel.app"
+      # Per-IP budget for /api/agent/run and /api/lab/run.
+      - key: ARBITRON_RATE_LIMIT_PER_MIN
+        value: "10"
+
+      # --- Runtime limits ---
       - key: ARBITRON_CACHE_DIR
         value: /tmp/arbitron_cache
+      - key: ARBITRON_MAX_SESSIONS
+        value: "64"
+      - key: ARBITRON_SESSION_TTL
+        value: "1800"
+      - key: ARBITRON_AGENT_TIMEOUT
+        value: "900"
+      - key: ARBITRON_LOG_LEVEL
+        value: "INFO"

@@ -1,7 +1,13 @@
 from .regime import RegimeDetector, SimpleRegimeDetector, build_regime_detector
-from .predictor import ReturnPredictor
+from .foundation import (
+    FoundationSignalResult,
+    MarketFoundationConfig,
+    build_foundation_signal,
+    market_state_embeddings,
+)
 
 __all__ = [
     "RegimeDetector", "SimpleRegimeDetector", "build_regime_detector",
-    "ReturnPredictor",
+    "FoundationSignalResult", "MarketFoundationConfig",
+    "build_foundation_signal", "market_state_embeddings",
 ]

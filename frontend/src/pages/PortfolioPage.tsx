@@ -6,6 +6,8 @@ import {
 } from 'recharts'
 import { api, WeightsResult, FrontierResult } from '../api'
 import { useStore } from '../store'
+import { above, fmt, isNum, orZero, pct } from '../format'
+import DataCaveatNotice from '../components/DataCaveatNotice'
 import clsx from 'clsx'
 
 const OPTIMIZERS = [
@@ -185,10 +187,17 @@ export default function PortfolioPage() {
 }
 
 function WeightsView({ weights: w, optimizerLabel }: { weights: WeightsResult; optimizerLabel: string }) {
+  // A long-short book has negative weights; the pie only shows the long leg,
+  // so filter on magnitude rather than assuming everything is positive.
   const pieData = w.tickers
     .map((t, i) => ({ name: t, value: +(w.weights[i] * 100).toFixed(2) }))
     .filter((d) => d.value > 0.5)
     .sort((a, b) => b.value - a.value)
+
+  const shorts = w.tickers
+    .map((t, i) => ({ name: t, value: +(w.weights[i] * 100).toFixed(2) }))
+    .filter((d) => d.value < -0.5)
+    .sort((a, b) => a.value - b.value)
 
   // Plain English summary
   const topHolding = pieData[0]
@@ -200,12 +209,18 @@ function WeightsView({ weights: w, optimizerLabel }: { weights: WeightsResult; o
       <div className="card border border-brand-500/20 bg-brand-500/5">
         <p className="text-xs font-semibold text-slate-200 mb-1">Portfolio Summary — {optimizerLabel}</p>
         <p className="text-xs text-slate-400 leading-relaxed">
-          Expected <span className="text-green-400 font-medium">{(w.expected_return * 100).toFixed(1)}% annual return</span> with{' '}
-          <span className="text-slate-300 font-medium">{(w.volatility * 100).toFixed(1)}% annual volatility</span> (Sharpe {w.sharpe.toFixed(2)}).
-          Top holding is <span className="text-slate-300 font-medium">{topHolding?.name}</span> at {topHolding?.value.toFixed(1)}%,
-          and the top 3 stocks make up {concentration.toFixed(0)}% of the portfolio.
+          Expected <span className="text-green-400 font-medium">{pct(w.expected_return)} annual return</span> with{' '}
+          <span className="text-slate-300 font-medium">{pct(w.volatility)} annual volatility</span> (Sharpe {fmt(w.sharpe)}).
+          Top holding is <span className="text-slate-300 font-medium">{topHolding?.name ?? '—'}</span> at {fmt(topHolding?.value, 1)}%,
+          and the top 3 stocks make up {fmt(concentration, 0)}% of the portfolio.
+        </p>
+        <p className="text-[10px] text-slate-600 mt-1.5">
+          Estimated from {w.n_observations} complete daily observations. Weights sum to{' '}
+          <span className="font-mono">{w.weight_sum.toFixed(6)}</span>.
         </p>
       </div>
+
+      <DataCaveatNotice caveats={w.data_caveats} />
 
       <div className="grid grid-cols-2 gap-4">
         {/* Metrics + holdings */}
@@ -215,25 +230,25 @@ function WeightsView({ weights: w, optimizerLabel }: { weights: WeightsResult; o
             <StatCell
               label="Expected Return"
               tip="Estimated annual return based on historical average returns of the selected stocks."
-              value={`${(w.expected_return * 100).toFixed(1)}%`}
-              positive={true}
+              value={pct(w.expected_return)}
+              positive={above(w.expected_return, 0)}
             />
             <StatCell
               label="Annual Volatility"
               tip="How much the portfolio value will swing up and down per year. Lower = smoother ride."
-              value={`${(w.volatility * 100).toFixed(1)}%`}
+              value={pct(w.volatility)}
             />
             <StatCell
               label="Sharpe Ratio"
               tip="Return earned per unit of risk. Above 1.0 is good. This is the main metric to optimise."
-              value={w.sharpe.toFixed(3)}
-              positive={w.sharpe > 0.5}
+              value={fmt(w.sharpe, 3)}
+              positive={above(w.sharpe, 0.5)}
             />
             <StatCell
               label="Diversification"
               tip="How much diversification benefit you get vs holding each stock alone. Higher = more diversified."
-              value={w.diversification_ratio.toFixed(3)}
-              positive={true}
+              value={fmt(w.diversification_ratio, 3)}
+              positive={above(w.diversification_ratio, 1)}
             />
           </div>
 
@@ -252,6 +267,25 @@ function WeightsView({ weights: w, optimizerLabel }: { weights: WeightsResult; o
               ))}
             </div>
           </div>
+
+          {shorts.length > 0 && (
+            <div>
+              <p className="text-[10px] text-slate-500 uppercase tracking-wider mb-2">
+                Short Positions
+                <span className="normal-case tracking-normal ml-1 text-slate-600">
+                  — held, not silently zeroed
+                </span>
+              </p>
+              <div className="flex flex-wrap gap-2">
+                {shorts.map((d) => (
+                  <span key={d.name} className="text-[11px] font-mono px-2 py-1 rounded-lg
+                                                bg-red-950/30 border border-red-800/40 text-red-300">
+                    {d.name} {d.value.toFixed(1)}%
+                  </span>
+                ))}
+              </div>
+            </div>
+          )}
         </div>
 
         {/* Pie chart */}
@@ -277,13 +311,20 @@ function WeightsView({ weights: w, optimizerLabel }: { weights: WeightsResult; o
 }
 
 function FrontierChart({ frontier: f, optimal }: { frontier: FrontierResult; optimal: WeightsResult | null }) {
-  const data = f.volatilities.map((v, i) => ({
-    vol:    +(v * 100).toFixed(2),
-    ret:    +(f.returns[i] * 100).toFixed(2),
-    sharpe: +f.sharpes[i].toFixed(3),
-  }))
-  const opt = optimal
-    ? [{ vol: +(optimal.volatility * 100).toFixed(2), ret: +(optimal.expected_return * 100).toFixed(2) }]
+  const data = f.volatilities
+    .map((v, i) => ({
+      vol:    isNum(v) ? +(v * 100).toFixed(2) : null,
+      ret:    isNum(f.returns[i]) ? +(orZero(f.returns[i]) * 100).toFixed(2) : null,
+      sharpe: isNum(f.sharpes[i]) ? +orZero(f.sharpes[i]).toFixed(3) : null,
+    }))
+    .filter((d): d is { vol: number; ret: number; sharpe: number | null } =>
+      d.vol !== null && d.ret !== null)
+
+  const opt = optimal && isNum(optimal.volatility) && isNum(optimal.expected_return)
+    ? [{
+        vol: +(orZero(optimal.volatility) * 100).toFixed(2),
+        ret: +(orZero(optimal.expected_return) * 100).toFixed(2),
+      }]
     : []
 
   return (

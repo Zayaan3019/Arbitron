@@ -245,6 +245,38 @@ TOOL_SCHEMAS = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "run_quant_lab",
+            "description": (
+                "Run the flagship autonomous quant research lab: tests multiple factors, "
+                "optionally builds a market-foundation signal, audits every candidate "
+                "with PSR/DSR/PBO statistical defenses, and returns a ranked research memo."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "tickers": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Stock tickers to research. Use tickers from fetch_universe.",
+                    },
+                    "factor_names": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Optional factor subset. Omit to use the lab default research queue.",
+                    },
+                    "start_date": {"type": "string", "default": "2020-01-01"},
+                    "end_date": {"type": "string"},
+                    "horizon_days": {"type": "integer", "default": 21},
+                    "include_foundation": {"type": "boolean", "default": True},
+                    "transaction_cost_bps": {"type": "number", "default": 10},
+                },
+                "required": ["tickers"],
+            },
+        },
+    },
 ]
 
 
@@ -280,6 +312,8 @@ def execute_tool(
             return _tool_detect_regime(tool_input, cache_dir)
         elif tool_name == "compare_factors":
             return _tool_compare_factors(tool_input, cache_dir)
+        elif tool_name == "run_quant_lab":
+            return _tool_run_quant_lab(tool_input, cache_dir)
         else:
             return {"error": f"Unknown tool: {tool_name}"}
     except Exception as e:
@@ -486,7 +520,7 @@ def _tool_detect_regime(inp: dict, cache_dir: str) -> dict:
     # Fall back to a slice of DEFAULT_UNIVERSE (same start/end=None as other tools).
     tickers = inp.get("tickers") or DEFAULT_UNIVERSE[:15]
     prices  = md.get_prices(tickers, start=start, end=None)
-    returns = prices.pct_change().dropna().mean(axis=1)
+    returns = prices.pct_change(fill_method=None).dropna().mean(axis=1)
 
     detector = build_regime_detector(use_hmm=True)
     detector.fit(returns)
@@ -541,6 +575,60 @@ def _tool_compare_factors(inp: dict, cache_dir: str) -> dict:
     }
 
 
+def _tool_run_quant_lab(inp: dict, cache_dir: str) -> dict:
+    from arbitron.data.market import MarketData
+    from arbitron.lab import run_flagship_research_lab
+
+    md = _md(cache_dir)
+    tickers = inp["tickers"]
+    start = inp.get("start_date", "2020-01-01")
+    end = inp.get("end_date")
+    horizon = int(inp.get("horizon_days", 21))
+    include_foundation = bool(inp.get("include_foundation", True))
+    tc_bps = float(inp.get("transaction_cost_bps", 10))
+
+    prices = md.get_prices(tickers, start=start, end=None)
+    if end:
+        prices = prices[prices.index <= pd.Timestamp(end)]
+
+    report = run_flagship_research_lab(
+        prices=prices,
+        factor_names=inp.get("factor_names"),
+        horizon=horizon,
+        include_foundation=include_foundation,
+        transaction_cost=tc_bps / 10_000,
+    )
+
+    champion = report.get("champion") or {}
+    return _clean_json({
+        "lab_verdict": report.get("lab_verdict"),
+        "date_range": report.get("date_range"),
+        "champion": {
+            "name": champion.get("name"),
+            "kind": champion.get("kind"),
+            "research_score": champion.get("research_score"),
+            "metrics": champion.get("metrics"),
+            "audit": champion.get("audit"),
+            "regime_robustness": champion.get("regime_robustness"),
+        },
+        "defense_summary": report.get("defense_summary"),
+        "foundation": report.get("foundation"),
+        "research_memo": report.get("research_memo"),
+        "top_candidates": [
+            {
+                "name": c.get("name"),
+                "kind": c.get("kind"),
+                "research_score": c.get("research_score"),
+                "sharpe": (c.get("metrics") or {}).get("sharpe"),
+                "verdict": (c.get("audit") or {}).get("verdict"),
+                "dsr": (c.get("audit") or {}).get("deflated_sharpe"),
+                "pbo": (c.get("audit") or {}).get("pbo"),
+            }
+            for c in report.get("candidates", [])[:5]
+        ],
+    })
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -558,3 +646,21 @@ def _clean_dict(d: dict) -> dict:
         else:
             out[k] = v
     return out
+
+
+def _clean_json(obj):
+    """Recursively convert numpy scalars and NaN to JSON-safe values."""
+    if isinstance(obj, dict):
+        return {k: _clean_json(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_clean_json(v) for v in obj]
+    if isinstance(obj, tuple):
+        return [_clean_json(v) for v in obj]
+    if isinstance(obj, float) and (np.isnan(obj) or np.isinf(obj)):
+        return None
+    if isinstance(obj, (np.integer,)):
+        return int(obj)
+    if isinstance(obj, (np.floating,)):
+        v = float(obj)
+        return None if np.isnan(v) or np.isinf(v) else v
+    return obj

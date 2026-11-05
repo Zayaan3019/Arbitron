@@ -42,6 +42,8 @@ You have access to tools for:
 - Computing risk analytics (VaR, CVaR, factor exposures, drawdown metrics)
 - Detecting market regimes (Bull/Bear via HMM)
 - Comparing multiple factors side-by-side
+- Running the flagship research lab with PSR/DSR/PBO statistical defenses
+  and a market-foundation representation signal
 
 Research workflow:
 1. Call fetch_universe first to get tickers — save them for ALL subsequent calls
@@ -52,11 +54,15 @@ Research workflow:
 4. Backtest promising factors (IC IR > 0.3 or |t-stat| > 2)
 5. Optimise portfolio using best factors
 6. Compute risk metrics and detect regime (pass the fetched tickers)
-7. Synthesise findings into a structured report
+7. For serious research requests, call run_quant_lab to audit the champion
+   against multiple-testing, overfitting, drawdown, and regime robustness gates
+8. Synthesise findings into a structured report
 
 Standards:
 - Always use at least 2 years of data for factor evaluation
 - Require IC IR > 0.3 AND t-stat > 2 for a factor to pass screening
+- Prefer candidates with high Deflated Sharpe Ratio and low PBO, not merely
+  the highest in-sample Sharpe
 - Report confidence intervals and statistical significance
 - Flag data-mining concerns (multiple testing)
 - Be honest about limitations and out-of-sample risk
@@ -96,7 +102,8 @@ class ResearchReport:
 
 @dataclass
 class AgentEvent:
-    event_type: str      # "thinking" | "tool_call" | "tool_result" | "text" | "done" | "error"
+    # "thinking" | "tool_call" | "tool_result" | "usage" | "text" | "done" | "error"
+    event_type: str
     data: Any
 
 
@@ -125,6 +132,17 @@ class ArbitronAgent:
     TOOL_TIMEOUT = 120    # seconds per tool call
     GROQ_BASE_URL = "https://api.groq.com/openai/v1"
 
+    #: Maximum characters of a single tool result fed back to the model.
+    #: The lab payload alone runs to tens of kilobytes; unbounded, the whole
+    #: conversation was resent on every one of up to 25 iterations, so cost
+    #: grew quadratically and long runs died on the context limit.
+    MAX_TOOL_RESULT_CHARS = 3_000
+
+    #: Cumulative (prompt + completion) token budget for one run.  Groq
+    #: reports usage per response; when the running total crosses this the
+    #: loop stops and reports what it has rather than silently burning quota.
+    TOKEN_BUDGET = 120_000
+
     def __init__(
         self,
         api_key: Optional[str] = None,
@@ -132,12 +150,16 @@ class ArbitronAgent:
         max_iterations: int = MAX_ITERATIONS,
         model: str = MODEL,
         on_event: Optional[Callable[[AgentEvent], None]] = None,
+        token_budget: int = TOKEN_BUDGET,
+        max_tool_result_chars: int = MAX_TOOL_RESULT_CHARS,
     ) -> None:
         self.api_key        = api_key
         self.cache_dir      = cache_dir
         self.max_iterations = max_iterations
         self.model          = model
         self.on_event       = on_event   # optional sync callback
+        self.token_budget   = token_budget
+        self.max_tool_result_chars = max_tool_result_chars
 
         self._client = None   # lazy init
 
@@ -210,7 +232,10 @@ class ArbitronAgent:
         Yields AgentEvent objects with event_type in:
           "thinking"   — agent is reasoning (text chunk)
           "tool_call"  — tool about to be executed
-          "tool_result"— tool execution result
+          "tool_result"— tool execution result (full payload; the copy sent
+                         back to the model is truncated, see
+                         `_truncate_tool_result`)
+          "usage"      — token accounting for the iteration just completed
           "text"       — final report text chunk
           "done"       — loop complete, data has metadata
           "error"      — unrecoverable error
@@ -226,9 +251,23 @@ class ArbitronAgent:
 
         tool_calls_made: list[str] = []
         iteration = 0
+        tokens_used = 0
+        stop_reason = "complete"
 
         try:
             while iteration < self.max_iterations:
+                if tokens_used >= self.token_budget:
+                    stop_reason = "token_budget"
+                    yield AgentEvent(
+                        "text",
+                        f"\n\n**Run halted:** token budget of {self.token_budget:,} "
+                        f"exhausted after {iteration} iterations "
+                        f"({tokens_used:,} tokens used). The findings above are "
+                        "complete as far as they go; re-run with a narrower task "
+                        "to finish the analysis.",
+                    )
+                    break
+
                 iteration += 1
                 yield AgentEvent("thinking", f"[Iteration {iteration}] Calling model...")
 
@@ -239,6 +278,17 @@ class ArbitronAgent:
                     tool_choice="auto",
                     messages=messages,
                 )
+
+                usage = getattr(response, "usage", None)
+                if usage is not None:
+                    tokens_used += int(getattr(usage, "total_tokens", 0) or 0)
+                    yield AgentEvent("usage", {
+                        "iteration": iteration,
+                        "prompt_tokens": int(getattr(usage, "prompt_tokens", 0) or 0),
+                        "completion_tokens": int(getattr(usage, "completion_tokens", 0) or 0),
+                        "cumulative_tokens": tokens_used,
+                        "budget": self.token_budget,
+                    })
 
                 choice       = response.choices[0]
                 msg          = choice.message
@@ -282,6 +332,9 @@ class ArbitronAgent:
 
                         result = self._execute_tool_safe(tool_name, tool_input)
 
+                        # The UI gets the full result; the MODEL gets a
+                        # truncated copy, because the full payload would be
+                        # resent on every subsequent iteration.
                         yield AgentEvent("tool_result", {
                             "tool":   tool_name,
                             "result": result,
@@ -291,7 +344,7 @@ class ArbitronAgent:
                         messages.append({
                             "role":         "tool",
                             "tool_call_id": tool_id,
-                            "content":      json.dumps(result, default=str),
+                            "content":      self._truncate_tool_result(result),
                         })
 
                     continue   # next iteration with tool results in history
@@ -319,11 +372,16 @@ class ArbitronAgent:
             return
 
         elapsed = time.perf_counter() - t0
+        if stop_reason == "complete" and iteration >= self.max_iterations:
+            stop_reason = "max_iter"
+
         yield AgentEvent("done", {
-            "status":          "complete" if iteration < self.max_iterations else "max_iter",
+            "status":          stop_reason,
             "iterations":      iteration,
             "tool_calls_made": tool_calls_made,
             "messages":        messages,
+            "tokens_used":     tokens_used,
+            "token_budget":    self.token_budget,
             "elapsed_seconds": round(elapsed, 2),
         })
 
@@ -341,6 +399,27 @@ class ArbitronAgent:
                 "tool":  tool_name,
                 "message": f"{type(exc).__name__}: {exc}",
             }
+
+    def _truncate_tool_result(self, result: Any) -> str:
+        """
+        Serialise a tool result for the model, capped at
+        `max_tool_result_chars` with an explicit marker.
+
+        The cut is announced rather than silent: a model that cannot see it
+        was truncated will confidently reason over the half it received.
+        """
+        payload = json.dumps(result, default=str)
+        limit = self.max_tool_result_chars
+        if len(payload) <= limit:
+            return payload
+
+        dropped = len(payload) - limit
+        return (
+            payload[:limit]
+            + f"\n\n[truncated: {dropped:,} of {len(payload):,} characters omitted. "
+            "The result was too large to include in full. Ask for a narrower "
+            "slice if you need the omitted detail.]"
+        )
 
     # ------------------------------------------------------------------
     # Convenience: quick factor screen
@@ -424,12 +503,15 @@ def _cli():
             r = d['result']
             status = "✓" if not r.get("error") else "✗"
             print(f"\033[32m[result {status}] {d['tool']}\033[0m")
+        elif event.event_type == "usage":
+            d = event.data
+            print(f"\033[90m[tokens] {d['cumulative_tokens']:,}/{d['budget']:,}\033[0m")
         elif event.event_type == "text":
             print(f"\n\033[1m{event.data}\033[0m")
         elif event.event_type == "done":
             d = event.data
-            print(f"\n\033[33m[done] {d['iterations']} iters | "
-                  f"{d['elapsed_seconds']}s | "
+            print(f"\n\033[33m[done] {d['status']} | {d['iterations']} iters | "
+                  f"{d['elapsed_seconds']}s | {d.get('tokens_used', 0):,} tokens | "
                   f"tools: {', '.join(d['tool_calls_made'])}\033[0m")
         elif event.event_type == "error":
             print(f"\033[31m[error] {event.data}\033[0m")

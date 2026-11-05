@@ -24,10 +24,10 @@ from typing import Optional
 import numpy as np
 import pandas as pd
 
-from arbitron.factors.library import cross_section_rank
 from arbitron.backtest.metrics import (
     BacktestMetrics, compute_metrics, compute_drawdown_series,
 )
+from arbitron.trials import record_trial
 
 
 # ---------------------------------------------------------------------------
@@ -62,6 +62,11 @@ class BacktestResult:
     weights:        pd.DataFrame        # (rebal dates × tickers) weights
     factor_name:    str = ""
     config:         BacktestConfig = field(default_factory=BacktestConfig)
+    #: ticker → number of holding days on which the name had no price and
+    #: was therefore dropped from the book and its weight redistributed.
+    dropped_names:  dict = field(default_factory=dict)
+    #: Number of rebalance dates the engine actually traded.
+    n_rebalances:   int = 0
 
     def summary(self) -> dict:
         return {
@@ -73,6 +78,8 @@ class BacktestResult:
             "max_drawdown":  self.metrics.max_drawdown,
             "win_rate":      self.metrics.win_rate,
             "n_days":        self.metrics.n_days,
+            "n_rebalances":  self.n_rebalances,
+            "dropped_names": self.dropped_names,
         }
 
 
@@ -94,6 +101,15 @@ def run_factor_backtest(
       - Rebalance at the specified frequency.
       - Apply one-way transaction cost on turnover.
 
+    Missing prices: `MarketData` preserves genuine NaNs (pre-IPO,
+    post-delisting), so a held name can stop quoting mid-period.  Such a name
+    is removed from the book for the affected days and each leg is
+    renormalised over the names that are still live, preserving the book's
+    gross exposure.  Silently summing over NaN — the previous behaviour —
+    would have let a delisted name keep its weight while contributing
+    exactly zero return.  Every drop is reported in
+    `BacktestResult.dropped_names`.
+
     Args:
         factor:  (dates × tickers) factor values (raw, not yet ranked).
         prices:  (dates × tickers) adjusted close prices.
@@ -105,7 +121,7 @@ def run_factor_backtest(
     if cfg is None:
         cfg = BacktestConfig()
 
-    returns = prices.pct_change()
+    returns = prices.pct_change(fill_method=None)
 
     # Align factor and returns to common universe
     common_tickers = factor.columns.intersection(prices.columns)
@@ -118,6 +134,7 @@ def run_factor_backtest(
     strat_returns:  list[tuple[pd.Timestamp, float]] = []
     quintile_store: dict[int, list[float]] = {q: [] for q in range(1, cfg.n_quantiles + 1)}
     weights_store:  dict[pd.Timestamp, pd.Series] = {}
+    dropped_names:  dict[str, int] = {}
     prev_weights:   Optional[pd.Series] = None
 
     for i, rebal in enumerate(rebal_dates[:-1]):
@@ -141,8 +158,17 @@ def run_factor_backtest(
         if hold_dates.empty:
             continue
 
-        hold_rets   = returns.loc[hold_dates, weights.index]
-        port_rets   = hold_rets.multiply(weights, axis=1).sum(axis=1)
+        hold_rets = returns.loc[hold_dates, weights.index]
+
+        # Drop names with no price on a given day and renormalise each leg
+        # over the survivors, so the book keeps its intended gross exposure.
+        eff_weights, day_drops = _live_weights(weights, hold_rets)
+        for ticker, n in day_drops.items():
+            dropped_names[ticker] = dropped_names.get(ticker, 0) + n
+
+        # min_count=1 → a day on which NO held name quotes is NaN, not a
+        # fabricated 0.0 return.
+        port_rets = (eff_weights * hold_rets).sum(axis=1, min_count=1)
 
         # Transaction cost on turnover
         if prev_weights is not None:
@@ -177,12 +203,15 @@ def run_factor_backtest(
             weights=pd.DataFrame(),
             factor_name=factor_name,
             config=cfg,
+            dropped_names=dropped_names,
+            n_rebalances=0,
         )
 
     ret_series = (
         pd.DataFrame(strat_returns, columns=["date", "return"])
         .set_index("date")["return"]
         .sort_index()
+        .dropna()
     )
     ret_series.index = pd.to_datetime(ret_series.index)
 
@@ -199,6 +228,11 @@ def run_factor_backtest(
 
     w_df = pd.DataFrame(weights_store).T.fillna(0)
 
+    # Every backtest is a trial.  Record it so the Deflated Sharpe Ratio
+    # knows the true size of the search rather than only the survivors that
+    # made it into a comparison table.
+    record_trial(factor_name or "unnamed", metrics.sharpe)
+
     return BacktestResult(
         returns=ret_series,
         cumulative=cum,
@@ -208,6 +242,8 @@ def run_factor_backtest(
         weights=w_df,
         factor_name=factor_name,
         config=cfg,
+        dropped_names=dict(sorted(dropped_names.items(), key=lambda kv: -kv[1])),
+        n_rebalances=len(weights_store),
     )
 
 
@@ -216,11 +252,62 @@ def run_factor_backtest(
 # ---------------------------------------------------------------------------
 
 def _rebalance_dates(index: pd.DatetimeIndex, freq: str) -> list[pd.Timestamp]:
-    """Return all period-end dates within `index`."""
+    """
+    Return the last TRADING day of every period in `index`.
+
+    `resample(freq).last()` produces calendar period-end labels (31 Jan,
+    28 Feb, 31 Mar, ...).  Those labels are not trading days whenever a month
+    ends on a weekend or a holiday, so intersecting the resampled *index*
+    with the trading index — the previous implementation — silently deleted
+    those months entirely: 8 of 28 rebalances vanished on a typical run.
+
+    The fix is to resample the positional VALUES and map them back, which
+    yields the true last trading day of each period.
+    """
+    if len(index) == 0:
+        return []
     resampled = pd.Series(range(len(index)), index=index).resample(freq).last()
-    # Intersect with actual trading days
-    valid     = [d for d in resampled.index if d in index]
-    return sorted(valid)
+    return [index[int(i)] for i in resampled.dropna().values]
+
+
+def _live_weights(
+    weights:   pd.Series,
+    hold_rets: pd.DataFrame,
+) -> tuple[pd.DataFrame, dict[str, int]]:
+    """
+    Expand a static weight vector over the holding period, zeroing names with
+    no price and renormalising each leg over the survivors.
+
+    Long and short legs are renormalised *separately* so that a delisting on
+    one side cannot quietly turn a dollar-neutral book into a directional
+    one.  Returns the (days × tickers) effective weights and a
+    {ticker: n_days_dropped} diagnostic.
+    """
+    valid = hold_rets.notna()
+    base  = np.tile(weights.values.astype(float), (len(hold_rets), 1))
+    base  = np.where(valid.values, base, 0.0)
+
+    target_long  = float(weights[weights > 0].sum())
+    target_short = float(weights[weights < 0].sum())   # <= 0
+
+    pos = np.where(base > 0, base, 0.0)
+    neg = np.where(base < 0, base, 0.0)
+
+    pos_sum = pos.sum(axis=1, keepdims=True)
+    neg_sum = neg.sum(axis=1, keepdims=True)
+
+    if target_long > 0:
+        pos = np.divide(pos, pos_sum, out=np.zeros_like(pos), where=pos_sum > 0) * target_long
+    if target_short < 0:
+        neg = np.divide(neg, neg_sum, out=np.zeros_like(neg), where=neg_sum < 0) * target_short
+
+    effective = pd.DataFrame(
+        pos + neg, index=hold_rets.index, columns=hold_rets.columns
+    ).where(valid)
+
+    missing = (~valid).sum(axis=0)
+    drops = {str(t): int(n) for t, n in missing.items() if n > 0}
+    return effective, drops
 
 
 def _quintile_weights(
