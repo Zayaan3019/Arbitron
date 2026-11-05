@@ -3,7 +3,7 @@
  */
 
 import { create } from 'zustand'
-import type { ICStats, BacktestResult, WeightsResult, RiskResult, AgentEvent } from './api'
+import type { ICStats, BacktestResult, WeightsResult, RiskResult, LabReport } from './api'
 
 interface AppState {
   // Shared settings
@@ -28,6 +28,10 @@ interface AppState {
   // Risk
   riskResult: RiskResult | null
   setRiskResult: (r: RiskResult | null) => void
+
+  // Research Lab
+  labResult: LabReport | null
+  setLabResult: (r: LabReport | null) => void
 
   // Agent chat
   agentMessages: AgentChatMessage[]
@@ -67,6 +71,9 @@ export const useStore = create<AppState>((set) => ({
 
   riskResult: null,
   setRiskResult: (r) => set({ riskResult: r }),
+
+  labResult: null,
+  setLabResult: (r) => set({ labResult: r }),
 
   agentMessages: [],
   agentRunning:  false,

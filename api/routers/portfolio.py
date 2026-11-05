@@ -1,101 +1,121 @@
-"""Portfolio optimization API router."""
+"""
+Portfolio optimization API router.
+
+Sync `def` handlers on purpose — see the note in `routers/data.py`.
+"""
 
 from __future__ import annotations
 
-import os
-
-import numpy as np
 from fastapi import APIRouter, HTTPException
 
+from ..deps import data_caveats, load_prices, resolve_tickers
 from ..schemas import (
-    PortfolioRequest, WeightsResponse, EfficientFrontierResponse,
+    EfficientFrontierResponse,
+    PortfolioRequest,
+    WeightsResponse,
 )
+from ..serialization import safe_float
 
 router = APIRouter()
-CACHE_DIR = os.environ.get("ARBITRON_CACHE_DIR", ".cache/arbitron")
+
+#: Minimum usable return observations before a covariance estimate is
+#: anything other than noise.
+MIN_OBSERVATIONS = 60
 
 
-def _resolve_tickers(req: PortfolioRequest) -> list[str]:
-    from arbitron.data import SECTOR_UNIVERSES, DEFAULT_UNIVERSE
-    if req.tickers:
-        return req.tickers
-    if req.universe == "SP500":
-        return DEFAULT_UNIVERSE
-    if req.universe in SECTOR_UNIVERSES:
-        return SECTOR_UNIVERSES[req.universe]
-    raise HTTPException(status_code=400, detail=f"Unknown universe: {req.universe}")
+def _returns_for(req: PortfolioRequest):
+    """Prices → complete-case daily returns, with an honest sample-size gate."""
+    from arbitron.data import to_returns
+
+    tickers = resolve_tickers(req.universe, req.tickers)
+    prices = load_prices(tickers, req.start_date, req.end_date)
+
+    # Names never quoted in the window (pre-IPO for the whole period) are
+    # dropped before `dropna()`, otherwise a single such column would empty
+    # the entire panel.
+    prices = prices.loc[:, prices.notna().sum() > MIN_OBSERVATIONS]
+    if prices.empty:
+        raise HTTPException(
+            status_code=422,
+            detail=f"No ticker has more than {MIN_OBSERVATIONS} observations in this window.",
+        )
+
+    returns = to_returns(prices).dropna()
+    if len(returns) < MIN_OBSERVATIONS:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"Only {len(returns)} complete observations after aligning "
+                f"{prices.shape[1]} tickers; need at least {MIN_OBSERVATIONS} "
+                "for a usable covariance estimate."
+            ),
+        )
+    return returns
 
 
 @router.post("/portfolio/optimize", response_model=WeightsResponse)
-async def optimize_portfolio(req: PortfolioRequest):
-    """
-    Optimise a portfolio and return weights with expected performance.
-    """
-    import pandas as pd
-    from arbitron.data import MarketData
+def optimize_portfolio(req: PortfolioRequest) -> WeightsResponse:
+    """Optimise a portfolio and return weights with expected performance."""
     from arbitron.portfolio import (
-        ledoit_wolf_covariance,
-        min_variance_portfolio,
-        max_sharpe_portfolio,
-        risk_parity_portfolio,
-        portfolio_performance,
         diversification_ratio,
+        ledoit_wolf_covariance,
+        max_sharpe_portfolio,
+        min_variance_portfolio,
+        portfolio_performance,
+        risk_parity_portfolio,
     )
 
-    tickers = _resolve_tickers(req)
+    returns = _returns_for(req)
+    cov = ledoit_wolf_covariance(returns)
+    mu = returns.mean() * 252
 
-    try:
-        md      = MarketData(cache_dir=CACHE_DIR)
-        prices  = md.get_prices(tickers, req.start_date, req.end_date)
-        returns = prices.pct_change().dropna()
+    if req.optimizer == "min_variance":
+        weights = min_variance_portfolio(
+            cov, long_only=req.long_only, max_weight=req.max_weight
+        )
+    elif req.optimizer == "risk_parity":
+        # ERC is only defined for strictly positive weights.
+        weights = risk_parity_portfolio(cov)
+    else:  # max_sharpe
+        weights = max_sharpe_portfolio(
+            mu, cov, rf=req.rf, long_only=req.long_only, max_weight=req.max_weight
+        )
 
-        cov = ledoit_wolf_covariance(returns)
-        mu  = returns.mean() * 252
+    perf = portfolio_performance(weights, mu, cov, rf=req.rf)
+    dr = diversification_ratio(weights, cov)
 
-        if req.optimizer == "min_variance":
-            weights = min_variance_portfolio(cov, max_weight=req.max_weight)
-        elif req.optimizer == "risk_parity":
-            weights = risk_parity_portfolio(cov)
-        else:  # max_sharpe
-            weights = max_sharpe_portfolio(mu, cov, rf=req.rf, max_weight=req.max_weight)
-
-        perf = portfolio_performance(weights, mu, cov, rf=req.rf)
-        dr   = diversification_ratio(weights, cov)
-
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=str(exc))
-
-    tickers_out = list(weights.index)
     return WeightsResponse(
-        tickers=tickers_out,
+        tickers=[str(t) for t in weights.index],
         weights=[round(float(w), 6) for w in weights],
-        expected_return=perf["expected_return"],
-        volatility=perf["volatility"],
-        sharpe=perf["sharpe"],
-        diversification_ratio=round(float(dr), 4),
+        weight_sum=round(float(weights.sum()), 10),
+        expected_return=safe_float(perf["expected_return"]),
+        volatility=safe_float(perf["volatility"]),
+        sharpe=safe_float(perf["sharpe"]),
+        diversification_ratio=safe_float(dr),
+        n_observations=len(returns),
+        data_caveats=data_caveats(req.universe, req.tickers),
     )
 
 
 @router.post("/portfolio/frontier", response_model=EfficientFrontierResponse)
-async def efficient_frontier(req: PortfolioRequest):
-    """Compute the efficient frontier (20 points)."""
-    from arbitron.data import MarketData
+def efficient_frontier(req: PortfolioRequest) -> EfficientFrontierResponse:
+    """Compute the mean-variance efficient frontier."""
     from arbitron.portfolio import ledoit_wolf_covariance, mean_variance_frontier
 
-    tickers = _resolve_tickers(req)
+    returns = _returns_for(req)
+    cov = ledoit_wolf_covariance(returns)
+    mu = returns.mean() * 252
+    frontier = mean_variance_frontier(mu, cov, n_points=25, long_only=req.long_only)
 
-    try:
-        md      = MarketData(cache_dir=CACHE_DIR)
-        prices  = md.get_prices(tickers, req.start_date, req.end_date)
-        returns = prices.pct_change().dropna()
-        cov     = ledoit_wolf_covariance(returns)
-        mu      = returns.mean() * 252
-        frontier = mean_variance_frontier(mu, cov, n_points=25)
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=str(exc))
+    if frontier.empty:
+        raise HTTPException(
+            status_code=422,
+            detail="Frontier optimisation did not converge for any target return.",
+        )
 
     return EfficientFrontierResponse(
-        returns=frontier["return"].tolist(),
-        volatilities=frontier["volatility"].tolist(),
-        sharpes=frontier["sharpe"].tolist(),
+        returns=[safe_float(v) for v in frontier["return"].tolist()],
+        volatilities=[safe_float(v) for v in frontier["volatility"].tolist()],
+        sharpes=[safe_float(v) for v in frontier["sharpe"].tolist()],
+        data_caveats=data_caveats(req.universe, req.tickers),
     )

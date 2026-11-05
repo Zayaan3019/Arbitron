@@ -2,6 +2,8 @@ import { useState } from 'react'
 import { Loader2, ShieldCheck, ShieldAlert, HelpCircle } from 'lucide-react'
 import { api, RiskResult } from '../api'
 import { useStore } from '../store'
+import { above, fmt, isNum, orZero, pct, type Num } from '../format'
+import DataCaveatNotice from '../components/DataCaveatNotice'
 import clsx from 'clsx'
 
 const METRIC_TIPS: Record<string, string> = {
@@ -112,7 +114,8 @@ function RiskDashboard({ r }: { r: RiskResult }) {
 
   // Plain English risk level
   const riskLevel =
-    r.var_95 < 0.01 ? { label: 'Low Risk',    color: 'text-green-400', bg: 'bg-green-950/30 border-green-800/40' }
+    !isNum(r.var_95) ? { label: 'Unknown Risk', color: 'text-slate-400', bg: 'bg-slate-800/40 border-slate-700' }
+    : r.var_95 < 0.01 ? { label: 'Low Risk',    color: 'text-green-400', bg: 'bg-green-950/30 border-green-800/40' }
     : r.var_95 < 0.02 ? { label: 'Moderate Risk', color: 'text-yellow-400', bg: 'bg-yellow-950/30 border-yellow-800/40' }
     : { label: 'High Risk', color: 'text-red-400', bg: 'bg-red-950/30 border-red-800/40' }
 
@@ -123,12 +126,15 @@ function RiskDashboard({ r }: { r: RiskResult }) {
         <p className={clsx('text-sm font-bold mb-1', riskLevel.color)}>{riskLevel.label} Portfolio</p>
         <p className="text-xs text-slate-300 leading-relaxed">
           On a typical bad day, expect to lose up to{' '}
-          <strong className="text-red-400">{(r.var_95 * 100).toFixed(2)}%</strong> of the portfolio (VaR 95%).
+          <strong className="text-red-400">{pct(r.var_95, 2)}</strong> of the portfolio (VaR 95%).
           In a genuine crisis, the average bad day could be{' '}
-          <strong className="text-red-400">{(r.cvar_95 * 100).toFixed(2)}%</strong> (CVaR 95%).
-          The longest drawdown period lasted <strong className="text-slate-200">{r.max_drawdown_duration_days} days</strong>.
+          <strong className="text-red-400">{pct(r.cvar_95, 2)}</strong> (CVaR 95%).
+          The longest drawdown period lasted <strong className="text-slate-200">{r.max_drawdown_duration_days} days</strong>,
+          measured over {r.n_observations} trading days.
         </p>
       </div>
+
+      <DataCaveatNotice caveats={r.data_caveats} />
 
       {/* Market Regime */}
       <div className="card flex items-center justify-between">
@@ -139,6 +145,12 @@ function RiskDashboard({ r }: { r: RiskResult }) {
             {isBull
               ? 'Markets are trending upward with low volatility'
               : 'Markets are choppy or trending downward'}
+          </p>
+          <p className="text-[10px] text-slate-600 mt-1.5 leading-relaxed max-w-md">
+            {r.regime_as_of ? `As of ${r.regime_as_of}. ` : ''}
+            This is the current regime only — computed from data up to that date and
+            nothing after it. Historical regime labels are deliberately not shown here:
+            a full-sample decoded path would label the past using the future.
           </p>
         </div>
         <div className={clsx(
@@ -169,9 +181,9 @@ function RiskDashboard({ r }: { r: RiskResult }) {
       <div className="card">
         <p className="text-xs font-semibold text-slate-300 mb-4">Additional Risk Metrics</p>
         <div className="grid grid-cols-3 gap-4">
-          <StatCell label="Ulcer Index"  tip={METRIC_TIPS['Ulcer Index']}  value={r.ulcer_index.toFixed(4)} />
-          <StatCell label="Tail Ratio"   tip={METRIC_TIPS['Tail Ratio']}   value={r.tail_ratio.toFixed(3)}  positive={r.tail_ratio > 1} />
-          <StatCell label="Market Beta"  tip={METRIC_TIPS['Market Beta']}  value={r.market_beta?.toFixed(3) ?? 'N/A'} />
+          <StatCell label="Ulcer Index"  tip={METRIC_TIPS['Ulcer Index']}  value={fmt(r.ulcer_index, 4)} />
+          <StatCell label="Tail Ratio"   tip={METRIC_TIPS['Tail Ratio']}   value={fmt(r.tail_ratio, 3)} positive={above(r.tail_ratio, 1)} />
+          <StatCell label="Market Beta"  tip={METRIC_TIPS['Market Beta']}  value={fmt(r.market_beta, 3)} />
         </div>
       </div>
 
@@ -207,9 +219,8 @@ function RiskDashboard({ r }: { r: RiskResult }) {
   )
 }
 
-function VarBar({ label, value, tip }: { label: string; value: number; tip?: string }) {
-  const pct   = (value * 100).toFixed(2)
-  const width = Math.min(value * 500, 100)
+function VarBar({ label, value, tip }: { label: string; value: Num; tip?: string }) {
+  const width = Math.min(orZero(value) * 500, 100)
 
   return (
     <div>
@@ -218,7 +229,7 @@ function VarBar({ label, value, tip }: { label: string; value: number; tip?: str
           {label}
           {tip && <Tip text={tip} />}
         </span>
-        <span className="text-sm font-mono font-semibold text-red-400">{pct}%</span>
+        <span className="text-sm font-mono font-semibold text-red-400">{pct(value, 2)}</span>
       </div>
       <div className="bg-surface-DEFAULT rounded-full h-2">
         <div className="bg-red-500 h-2 rounded-full transition-all" style={{ width: `${width}%` }} />

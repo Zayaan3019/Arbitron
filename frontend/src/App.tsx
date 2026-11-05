@@ -1,6 +1,7 @@
 import { BrowserRouter, Routes, Route, NavLink } from 'react-router-dom'
 import { useState, useEffect } from 'react'
-import { Bot, BarChart3, TrendingUp, ShieldAlert, Cpu, Wifi, WifiOff } from 'lucide-react'
+import { Bot, BarChart3, TrendingUp, ShieldAlert, Cpu, Wifi, WifiOff, BrainCircuit } from 'lucide-react'
+import LabPage      from './pages/LabPage'
 import AgentPage    from './pages/AgentPage'
 import FactorsPage  from './pages/FactorsPage'
 import BacktestPage from './pages/BacktestPage'
@@ -10,7 +11,8 @@ import { useStore } from './store'
 import clsx from 'clsx'
 
 const NAV = [
-  { to: '/',          icon: Bot,        label: 'AI Agent',    desc: 'Chat to research stocks' },
+  { to: '/',          icon: BrainCircuit, label: 'Research Lab', desc: 'Audit strategy candidates' },
+  { to: '/agent',     icon: Bot,        label: 'AI Agent',    desc: 'Chat to research stocks' },
   { to: '/factors',   icon: BarChart3,  label: 'Factors',     desc: 'Test what predicts returns' },
   { to: '/backtest',  icon: TrendingUp, label: 'Backtest',    desc: 'Replay a strategy in history' },
   { to: '/portfolio', icon: Cpu,        label: 'Portfolio',   desc: 'Find your optimal mix' },
@@ -189,7 +191,8 @@ export default function App() {
         {/* ── Main ── */}
         <main className="flex-1 overflow-y-auto bg-surface-DEFAULT">
           <Routes>
-            <Route path="/"          element={<AgentPage />} />
+            <Route path="/"          element={<LabPage />} />
+            <Route path="/agent"     element={<AgentPage />} />
             <Route path="/factors"   element={<FactorsPage />} />
             <Route path="/backtest"  element={<BacktestPage />} />
             <Route path="/portfolio" element={<PortfolioPage />} />

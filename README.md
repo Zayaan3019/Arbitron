@@ -8,6 +8,10 @@
 
 Arbitron is a full-stack quantitative research platform combining:
 
+- **Autonomous Quant Research Lab** - Ranks factor and foundation-model candidates, audits them with deployment gates, and emits a research memo
+- **Statistical Defense Layer** - Probabilistic Sharpe Ratio, Deflated Sharpe Ratio, Probability of Backtest Overfitting, drawdown gates, and regime robustness checks
+- **Market Foundation Modeling** - Self-supervised market-state embeddings plus a walk-forward Ridge adapter that produces a cross-sectional alpha signal
+
 - **Autonomous LLM Agent** — Llama 3.3 70B (via Groq free API) uses function calling in a ReAct loop to plan and execute research tasks end-to-end
 - **Quant Factor Library** — 13 named factors (momentum, reversal, volatility, RSI, MACD, Bollinger, price acceleration, ...)
 - **Walk-Forward Backtesting** — Purged and embargoed splits (López de Prado, 2018), quintile L/S portfolio with transaction costs
@@ -17,6 +21,22 @@ Arbitron is a full-stack quantitative research platform combining:
 - **ML Return Predictor** — Random Forest with rolling Sharpe / beta / regime features, walk-forward fitting
 - **FastAPI Backend** — REST + WebSocket streaming for agent events
 - **React Dashboard** — Agent chat, factor browser, backtest viewer, portfolio optimizer, risk dashboard
+
+---
+
+## Flagship Research Lab
+
+The new `/api/lab/run` workflow turns Arbitron into an autonomous quant research lab:
+
+1. Computes a research queue of candidate factors.
+2. Builds an optional market-foundation signal from causal multi-scale price features.
+3. Runs walk-forward quintile backtests with transaction costs.
+4. Audits every candidate with PSR, DSR, PBO, drawdown, and sample-size gates.
+5. Checks whether performance survives bull/bear regime splits.
+6. Ranks candidates by a defense-aware research score.
+7. Returns a champion, candidate queue, foundation diagnostics, equity curve, and research memo.
+
+This is designed to avoid the usual student-project trap: picking the prettiest backtest. The lab explicitly asks whether the result survives multiple-testing, overfitting, non-normal returns, and market-regime instability.
 
 ---
 
@@ -59,6 +79,35 @@ arbitron/
 
 ---
 
+## Statistical Defense Layer
+
+Arbitron now separates "looks good" from "survives audit":
+
+| Defense | Why it matters |
+|---------|----------------|
+| Probabilistic Sharpe Ratio | Estimates whether Sharpe is statistically above a hurdle after skew/kurtosis adjustment |
+| Deflated Sharpe Ratio | Raises the Sharpe hurdle when many strategy variants were tested |
+| Probability of Backtest Overfitting | Uses CSCV-style train/test splits to measure if the selected champion collapses out of sample |
+| Regime Robustness | Reports strategy behavior in bull and bear regimes |
+| Drawdown Gate | Blocks high-Sharpe strategies that hide unacceptable path risk |
+
+---
+
+## Market Foundation Signal
+
+The local foundation module does not require PyTorch or paid model APIs. It learns representations from:
+
+- Multi-horizon asset returns
+- Realized volatility and volatility ratios
+- Rolling drawdowns
+- Market beta and correlation
+- Cross-sectional rank/z-score structure
+- Date-level market breadth, dispersion, drawdown, skew, and kurtosis
+
+The learned latent state is used by a walk-forward Ridge adapter to predict cross-sectional forward returns. This gives Arbitron a foundation-model-style representation layer while keeping the project reproducible on a laptop.
+
+---
+
 ## Quick Start
 
 ### 1. Install
@@ -80,7 +129,7 @@ cp .env.example .env
 
 ```bash
 pytest tests/ -v
-# → 84/84 passed
+# → 143 passed
 ```
 
 ### 4. Start the API server
@@ -128,6 +177,7 @@ The agent has access to 8 tools that map directly to the quant library:
 | `compute_risk_metrics` | VaR, CVaR, drawdown, factor beta, tail ratio |
 | `detect_regime` | Current market regime (Bull/Bear) |
 | `compare_factors` | Side-by-side IC comparison for multiple factors |
+| `run_quant_lab` | Full research lab with statistical defenses + market foundation signal |
 
 ---
 
@@ -182,6 +232,15 @@ All use Ledoit-Wolf shrinkage covariance (sklearn) by default.
 - López de Prado (2018) — *Advances in Financial Machine Learning*: purged CV, embargo
 - Hamilton (1989) — Hidden Markov Model for regime detection
 - Yao et al. (2023) — ReAct: Synergizing Reasoning and Acting in Language Models
+
+---
+
+Additional research basis for the flagship lab:
+
+- Bailey & Lopez de Prado (2014) - Deflated Sharpe Ratio
+- Bailey, Borwein, Lopez de Prado & Zhu (2014) - Probability of Backtest Overfitting
+- Ansari et al. (2024) - Chronos: time-series foundation models
+- Das et al. (2024) - TimesFM: decoder-only time-series foundation model
 
 ---
 

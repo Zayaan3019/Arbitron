@@ -1,54 +1,49 @@
-"""Market data API router."""
+"""
+Market data API router.
+
+Handlers are plain `def`, not `async def`: they do blocking network I/O
+(yfinance) and blocking CPU work.  On the event loop that stalls every other
+request in the process; as a sync handler FastAPI runs them on the threadpool
+where blocking is expected.
+"""
 
 from __future__ import annotations
 
-import os
-from typing import List
+from fastapi import APIRouter
 
-from fastapi import APIRouter, HTTPException
-
-from ..schemas import PriceRequest, PriceResponse, FactorListResponse
+from ..deps import data_caveats, load_prices, resolve_tickers
+from ..schemas import PriceRequest, PriceResponse, UniverseListResponse
 
 router = APIRouter()
 
-CACHE_DIR = os.environ.get("ARBITRON_CACHE_DIR", ".cache/arbitron")
 
+@router.get("/universes", response_model=UniverseListResponse)
+def list_universes() -> UniverseListResponse:
+    """List available stock universes, with their data limitations."""
+    from arbitron.data import DEFAULT_UNIVERSE, SECTOR_UNIVERSES
 
-@router.get("/universes", response_model=dict)
-async def list_universes():
-    """List available stock universes."""
-    from arbitron.data import SECTOR_UNIVERSES, DEFAULT_UNIVERSE
-    return {
-        "SP500": DEFAULT_UNIVERSE,
-        **SECTOR_UNIVERSES,
-    }
+    return UniverseListResponse(
+        universes={"SP500": list(DEFAULT_UNIVERSE), **SECTOR_UNIVERSES},
+        data_caveats=data_caveats(universe=None),
+    )
 
 
 @router.post("/data/prices", response_model=PriceResponse)
-async def get_prices(req: PriceRequest):
+def get_prices(req: PriceRequest) -> PriceResponse:
     """Fetch historical prices for a list of tickers or a named universe."""
-    from arbitron.data import MarketData, SECTOR_UNIVERSES, DEFAULT_UNIVERSE
+    tickers = resolve_tickers(req.universe, req.tickers)
+    prices = load_prices(tickers, req.start_date, req.end_date)
 
-    tickers = req.tickers
-    if not tickers:
-        if req.universe == "SP500":
-            tickers = DEFAULT_UNIVERSE
-        elif req.universe and req.universe in SECTOR_UNIVERSES:
-            tickers = SECTOR_UNIVERSES[req.universe]
-        else:
-            raise HTTPException(status_code=400,
-                                detail="Provide tickers or a valid universe name")
-
-    try:
-        md = MarketData(cache_dir=CACHE_DIR)
-        prices = md.get_prices(tickers, req.start_date, req.end_date, req.field)
-    except Exception as exc:
-        raise HTTPException(status_code=502, detail=str(exc))
+    # Leading NaNs are preserved on purpose (pre-IPO names); report the real
+    # coverage instead of pretending the panel is rectangular.
+    coverage = {str(col): int(prices[col].notna().sum()) for col in prices.columns}
 
     return PriceResponse(
-        tickers=list(prices.columns),
+        tickers=[str(c) for c in prices.columns],
         dates=[d.strftime("%Y-%m-%d") for d in prices.index],
-        prices={col: prices[col].tolist() for col in prices.columns},
+        prices={str(col): prices[col].tolist() for col in prices.columns},
         n_rows=len(prices),
         n_cols=len(prices.columns),
+        observations_per_ticker=coverage,
+        data_caveats=data_caveats(req.universe, req.tickers),
     )

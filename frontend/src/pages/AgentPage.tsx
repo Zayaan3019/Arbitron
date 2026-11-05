@@ -33,6 +33,7 @@ function friendlyError(err: unknown): string {
 
 export default function AgentPage() {
   const [input, setInput] = useState('')
+  const [tokenUsage, setTokenUsage] = useState<{ used: number; budget: number } | null>(null)
   const bottomRef         = useRef<HTMLDivElement>(null)
   const disconnectRef     = useRef<(() => void) | null>(null)
 
@@ -82,9 +83,19 @@ export default function AgentPage() {
         content: `${ok ? 'Done' : 'Failed'}: ${TOOL_LABELS[toolName] ?? toolName}`,
         timestamp: Date.now(), meta: d,
       })
+    } else if (event.event_type === 'usage') {
+      // Token accounting, surfaced so a run that stops on budget rather than
+      // on a conclusion is visibly different from one that finished.
+      const d = event.data as Record<string, number>
+      setTokenUsage({ used: d.cumulative_tokens ?? 0, budget: d.budget ?? 0 })
     } else if (event.event_type === 'text') {
       appendAgentMessage({ id: nextId(), type: 'text', content: String(event.data ?? ''), timestamp: Date.now() })
-    } else if (event.event_type === 'done' || event.event_type === 'error') {
+    } else if (event.event_type === 'error') {
+      const d = event.data as Record<string, unknown> | string | null
+      const message = typeof d === 'string' ? d : String((d as Record<string, unknown>)?.message ?? 'Agent run failed.')
+      appendAgentMessage({ id: nextId(), type: 'error', content: message, timestamp: Date.now() })
+      setAgentRunning(false)
+    } else if (event.event_type === 'done') {
       setAgentRunning(false)
     }
   }
@@ -103,6 +114,12 @@ export default function AgentPage() {
           <p className="text-xs text-slate-500 mt-0.5">
             Describe what you want to research — the AI writes and runs the analysis for you
           </p>
+          {tokenUsage && tokenUsage.budget > 0 && (
+            <p className="text-[10px] text-slate-600 mt-1 font-mono">
+              {tokenUsage.used.toLocaleString()} / {tokenUsage.budget.toLocaleString()} tokens
+              {tokenUsage.used >= tokenUsage.budget && ' — budget reached, run halted'}
+            </p>
+          )}
         </div>
         {agentMessages.length > 0 && (
           <button

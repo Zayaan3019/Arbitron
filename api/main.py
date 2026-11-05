@@ -3,27 +3,32 @@ Arbitron FastAPI application.
 
 Endpoints:
   GET  /health
+  GET  /api/universes
+  POST /api/data/prices
   GET  /api/factors
-  POST /api/factors/compute
   POST /api/factors/evaluate
   POST /api/backtest
   POST /api/portfolio/optimize
-  GET  /api/portfolio/frontier
+  POST /api/portfolio/frontier
   POST /api/risk
+  POST /api/lab/run
   POST /api/agent/run         — fire-and-forget, returns session_id
   WS   /ws/agent/{session_id} — streams AgentEvent messages as JSON
+
+Everything under /api requires an `X-API-Key` header when
+`ARBITRON_REQUIRE_API_KEY=true` (see `api.security`).  `/health` is
+deliberately unauthenticated so platform health checks keep working.
 """
 
 from __future__ import annotations
 
 import asyncio
-import json
+import logging
 import os
-import uuid
 from contextlib import asynccontextmanager
-from typing import Any, Dict
 
-from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi import Depends, FastAPI, WebSocket, WebSocketDisconnect
+
 from fastapi.middleware.cors import CORSMiddleware
 
 # Load .env for local development (no-op in production where env vars are injected)
@@ -33,20 +38,28 @@ try:
 except ImportError:
     pass
 
-from .routers import data, factors, backtest, portfolio, risk, agent as agent_router
+from .routers import data, factors, backtest, portfolio, risk, lab, agent as agent_router
 from .schemas import HealthResponse
+from .security import (
+    api_key_required,
+    configured_keys,
+    log_startup_posture,
+    require_api_key,
+)
+from .serialization import SafeJSONResponse, json_safe
+from .sessions import SessionRegistry
+
+log = logging.getLogger("arbitron.api")
+
+#: Bounded registry of live agent runs (see api/sessions.py).
+SESSIONS = SessionRegistry(
+    max_sessions=int(os.environ.get("ARBITRON_MAX_SESSIONS", "64")),
+    ttl_seconds=float(os.environ.get("ARBITRON_SESSION_TTL", "1800")),
+)
 
 
-# ---------------------------------------------------------------------------
-# In-memory session store (agent tasks)
-# ---------------------------------------------------------------------------
-
-# session_id → asyncio.Queue of AgentEvent dicts
-_sessions: Dict[str, asyncio.Queue] = {}
-
-
-def get_sessions() -> Dict[str, asyncio.Queue]:
-    return _sessions
+def get_sessions() -> SessionRegistry:
+    return SESSIONS
 
 
 # ---------------------------------------------------------------------------
@@ -55,10 +68,42 @@ def get_sessions() -> Dict[str, asyncio.Queue]:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Startup: nothing heavy needed
+    logging.basicConfig(level=os.environ.get("ARBITRON_LOG_LEVEL", "INFO"))
+    log_startup_posture()
     yield
-    # Shutdown: clean up sessions
-    _sessions.clear()
+    SESSIONS.clear()
+
+
+def _cors_origins() -> tuple[list[str], bool]:
+    """
+    Resolve the CORS allow-list.
+
+    A wildcard origin combined with an unauthenticated API is what let
+    anyone on the internet spend the operator's Groq key, so `*` is now
+    refused whenever key enforcement is off: it must be an explicit,
+    deliberate configuration in both places or neither.
+    """
+    raw = os.environ.get("ARBITRON_CORS_ORIGIN", "").strip()
+
+    if not raw:
+        return ([
+            "http://localhost:5173",
+            "http://localhost:3000",
+            "http://127.0.0.1:5173",
+        ], True)
+
+    if raw == "*":
+        if not api_key_required():
+            log.warning(
+                "ARBITRON_CORS_ORIGIN='*' with API key enforcement OFF. "
+                "Falling back to localhost origins. Set ARBITRON_CORS_ORIGIN "
+                "to your real frontend origin."
+            )
+            return (["http://localhost:5173", "http://127.0.0.1:5173"], True)
+        # Wildcard is tolerable only because the API key is the real gate.
+        return (["*"], False)   # credentials are not allowed with a wildcard
+
+    return ([o.strip() for o in raw.split(",") if o.strip()], True)
 
 
 def create_app() -> FastAPI:
@@ -66,114 +111,128 @@ def create_app() -> FastAPI:
         title="Arbitron API",
         description=(
             "Autonomous Quant Research Agent — REST + WebSocket API.\n\n"
-            "Powered by Claude tool_use, walk-forward backtesting, "
-            "Ledoit-Wolf portfolio optimization, and HMM regime detection."
+            "Walk-forward backtesting, Ledoit-Wolf portfolio optimisation, "
+            "causal HMM regime detection, and a statistical-defense layer "
+            "(PSR / Deflated Sharpe / PBO).\n\n"
+            "**Data limitation:** the built-in universes are today's index "
+            "members, not point-in-time membership. Every response derived "
+            "from them carries a `data_caveats` block spelling out the "
+            "survivorship and selection bias."
         ),
-        version="0.1.0",
+        version="0.2.0",
         lifespan=lifespan,
         docs_url="/docs",
         redoc_url="/redoc",
+        default_response_class=SafeJSONResponse,
     )
 
-    # CORS — dev: localhost only; prod: set ARBITRON_CORS_ORIGIN=* or comma-separated list
-    _cors_env = os.environ.get("ARBITRON_CORS_ORIGIN", "")
-    if _cors_env == "*":
-        _allow_origins = ["*"]
-        _allow_credentials = False  # credentials not allowed with wildcard origin
-    elif _cors_env:
-        _allow_origins = [o.strip() for o in _cors_env.split(",")]
-        _allow_credentials = True
-    else:
-        _allow_origins = [
-            "http://localhost:5173",
-            "http://localhost:3000",
-            "http://127.0.0.1:5173",
-        ]
-        _allow_credentials = True
-
+    allow_origins, allow_credentials = _cors_origins()
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=_allow_origins,
-        allow_credentials=_allow_credentials,
-        allow_methods=["*"],
-        allow_headers=["*"],
+        allow_origins=allow_origins,
+        allow_credentials=allow_credentials,
+        allow_methods=["GET", "POST", "OPTIONS"],
+        allow_headers=["Content-Type", "X-API-Key"],
     )
 
     # -----------------------------------------------------------------------
-    # Include routers
+    # Routers — every /api route sits behind the API-key dependency
     # -----------------------------------------------------------------------
-    app.include_router(data.router,      prefix="/api",       tags=["data"])
-    app.include_router(factors.router,   prefix="/api",       tags=["factors"])
-    app.include_router(backtest.router,  prefix="/api",       tags=["backtest"])
-    app.include_router(portfolio.router, prefix="/api",       tags=["portfolio"])
-    app.include_router(risk.router,      prefix="/api",       tags=["risk"])
-    app.include_router(
-        agent_router.router,
-        prefix="/api",
-        tags=["agent"],
-        # Pass session store to router via app state
-    )
+    api_guard = [Depends(require_api_key)]
+
+    for module, tag in (
+        (data,         "data"),
+        (factors,      "factors"),
+        (backtest,     "backtest"),
+        (portfolio,    "portfolio"),
+        (risk,         "risk"),
+        (lab,          "research-lab"),
+        (agent_router, "agent"),
+    ):
+        app.include_router(
+            module.router, prefix="/api", tags=[tag], dependencies=api_guard
+        )
 
     # -----------------------------------------------------------------------
-    # Health
+    # Health — unauthenticated so platform probes keep working
     # -----------------------------------------------------------------------
-    @app.get("/health", response_model=HealthResponse)
-    async def health():
-        return HealthResponse()
+    @app.get("/health", response_model=HealthResponse, tags=["meta"])
+    def health() -> HealthResponse:
+        return HealthResponse(
+            api_key_required=api_key_required(),
+            **SESSIONS.stats(),
+        )
 
     # -----------------------------------------------------------------------
     # WebSocket: stream agent events
     # -----------------------------------------------------------------------
     @app.websocket("/ws/agent/{session_id}")
     async def agent_ws(websocket: WebSocket, session_id: str):
+        # Browsers cannot set headers on a WebSocket handshake, so the key
+        # travels as a query parameter here.
+        if api_key_required():
+            token = websocket.query_params.get("api_key", "")
+            if not any(token == k for k in configured_keys()):
+                await websocket.close(code=4401, reason="Invalid or missing api_key")
+                return
+
         await websocket.accept()
 
-        if session_id not in _sessions:
-            await websocket.send_json({"error": "Unknown session_id"})
+        session = SESSIONS.get(session_id)
+        if session is None:
+            await websocket.send_json({
+                "event_type": "error",
+                "data": {"message": "Unknown or expired session_id"},
+                "session_id": session_id,
+            })
             await websocket.close()
             return
 
-        queue = _sessions[session_id]
+        queue = session.queue
         try:
             while True:
                 try:
-                    event = await asyncio.wait_for(queue.get(), timeout=120.0)
+                    event = await asyncio.wait_for(queue.get(), timeout=30.0)
                 except asyncio.TimeoutError:
-                    await websocket.send_json({"event_type": "ping"})
+                    # Keep intermediaries from closing an idle connection, and
+                    # surface a silently-dead worker instead of hanging forever.
+                    if session.task is not None and session.task.done() and queue.empty():
+                        await websocket.send_json({
+                            "event_type": "error",
+                            "data": {"message": "Agent worker exited without a result."},
+                            "session_id": session_id,
+                        })
+                        break
+                    await websocket.send_json({"event_type": "ping", "data": None,
+                                               "session_id": session_id})
                     continue
 
-                payload = {
+                await websocket.send_json({
                     "event_type": event.get("event_type"),
-                    "data":       _json_safe(event.get("data")),
+                    "data":       json_safe(event.get("data")),
                     "session_id": session_id,
-                }
-                await websocket.send_json(payload)
+                })
 
                 if event.get("event_type") in ("done", "error"):
                     break
 
         except WebSocketDisconnect:
             pass
+        except Exception as exc:              # never let a stream kill the loop
+            log.exception("WebSocket stream failed for session %s", session_id)
+            try:
+                await websocket.send_json({
+                    "event_type": "error",
+                    "data": {"message": f"Stream failed: {exc}"},
+                    "session_id": session_id,
+                })
+            except Exception:
+                pass
         finally:
-            _sessions.pop(session_id, None)
+            SESSIONS.remove(session_id)
 
-    # Store session registry on app state so routers can access it
-    app.state.sessions = _sessions
-
+    app.state.sessions = SESSIONS
     return app
-
-
-def _json_safe(obj: Any) -> Any:
-    """Recursively convert non-JSON-serialisable types."""
-    if isinstance(obj, dict):
-        return {k: _json_safe(v) for k, v in obj.items()}
-    if isinstance(obj, (list, tuple)):
-        return [_json_safe(x) for x in obj]
-    try:
-        json.dumps(obj)
-        return obj
-    except (TypeError, ValueError):
-        return str(obj)
 
 
 app = create_app()

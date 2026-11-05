@@ -2,6 +2,8 @@ import { useState, useEffect } from 'react'
 import { Loader2, HelpCircle } from 'lucide-react'
 import { api, ICStats } from '../api'
 import { useStore } from '../store'
+import { above, below, fmt, isNum, orZero, pct } from '../format'
+import DataCaveatNotice from '../components/DataCaveatNotice'
 import clsx from 'clsx'
 
 // Human-readable factor names
@@ -26,11 +28,12 @@ const METRIC_TIPS: Record<string, string> = {
   'IC Mean':   'Information Coefficient: how well the factor predicts next-month returns on average. Positive = right direction. Above 0.02 is good for a factor.',
   'IC Std':    'How consistent the IC is over time. Lower = more reliable. A factor with IC 0.05 every month beats one that swings wildly.',
   'IC IR':     'IC Information Ratio = IC Mean ÷ IC Std. Think of it as the Sharpe Ratio for the factor\'s predictiveness. Above 0.3 passes; above 0.5 is excellent.',
-  't-stat':    'Statistical significance. Above 2.0 means there\'s less than 5% chance the result is random noise.',
+  't-stat':    'Statistical significance, Newey-West corrected for the overlap in forward returns. Above 2.0 means less than a 5% chance the result is random noise. This is the number to quote.',
+  't-stat (naive)': 'The same test WITHOUT the overlap correction. Daily cross-sections against a 21-day forward return share 20 of their 21 days, so this figure is inflated by roughly sqrt(21) ≈ 4.6x. Shown only so you can see how large the correction is — never quote it.',
   '% Positive':'The fraction of months where the factor predicted returns in the right direction. Above 50% is better than a coin flip.',
-  'N Periods': 'How many months of data were used. More periods = more reliable conclusion.',
+  'N Periods': 'How many cross-sections were used. More periods = more reliable conclusion.',
   'Risk Premium (γ)': 'Fama-MacBeth gamma: the average extra return earned per unit of factor exposure, controlling for all other factors.',
-  'FM t-stat': 'Statistical significance of the risk premium. Above 2.0 means the premium is real, not random.',
+  'FM t-stat': 'Statistical significance of the risk premium, Newey-West corrected. Above 2.0 means the premium is real, not random.',
 }
 
 function friendlyError(err: unknown): string {
@@ -154,12 +157,18 @@ export default function FactorsPage() {
 function ICStatsCard({ stats }: { stats: ICStats }) {
   const ir = stats.ic_ir
   const grade =
-    ir > 0.5 ? { label: 'Excellent Signal', color: 'text-green-400', bg: 'bg-green-950/30 border-green-800/40', summary: 'This factor is a strong and consistent predictor of stock returns. Highly worth using in a strategy.' }
+    !isNum(ir) ? { label: 'Not Evaluable', color: 'text-slate-400', bg: 'bg-slate-800/40 border-slate-700', summary: 'Not enough valid cross-sections in this window to measure predictive power. Widen the date range or the universe.' }
+    : ir > 0.5 ? { label: 'Excellent Signal', color: 'text-green-400', bg: 'bg-green-950/30 border-green-800/40', summary: 'This factor is a strong and consistent predictor of stock returns. Highly worth using in a strategy.' }
     : ir > 0.3 ? { label: 'Good Signal', color: 'text-blue-400', bg: 'bg-blue-950/30 border-blue-800/40', summary: 'This factor shows a meaningful edge. The IC Information Ratio clears the standard hurdle of 0.3.' }
     : ir > 0.1 ? { label: 'Weak Signal', color: 'text-yellow-400', bg: 'bg-yellow-950/30 border-yellow-800/40', summary: 'Some signal exists but it\'s not reliable enough to use alone. Could work combined with others.' }
     : { label: 'No Reliable Signal', color: 'text-red-400', bg: 'bg-red-950/30 border-red-800/40', summary: 'This factor does not reliably predict returns for the selected universe and date range.' }
 
   const info = FACTOR_LABELS[stats.factor_name]
+
+  const inflation =
+    isNum(stats.t_stat) && isNum(stats.t_stat_naive) && Math.abs(stats.t_stat) > 1e-9
+      ? Math.abs(stats.t_stat_naive / stats.t_stat)
+      : null
 
   return (
     <div className="space-y-4">
@@ -177,6 +186,8 @@ function ICStatsCard({ stats }: { stats: ICStats }) {
         <p className="text-xs text-slate-300 leading-relaxed">{grade.summary}</p>
       </div>
 
+      <DataCaveatNotice caveats={stats.data_caveats} />
+
       {/* IC stats */}
       <div className="card">
         <p className="text-xs font-semibold text-slate-300 mb-4">
@@ -186,31 +197,61 @@ function ICStatsCard({ stats }: { stats: ICStats }) {
         <div className="grid grid-cols-3 gap-4">
           <StatCell
             label="IC Mean" tip={METRIC_TIPS['IC Mean']}
-            value={stats.ic_mean.toFixed(4)}
-            positive={stats.ic_mean > 0}
+            value={fmt(stats.ic_mean, 4)}
+            positive={above(stats.ic_mean, 0)}
           />
           <StatCell
             label="IC Std" tip={METRIC_TIPS['IC Std']}
-            value={stats.ic_std.toFixed(4)}
+            value={fmt(stats.ic_std, 4)}
           />
           <StatCell
             label="IC IR" tip={METRIC_TIPS['IC IR']}
-            value={stats.ic_ir.toFixed(4)}
-            positive={stats.ic_ir > 0.3}
+            value={fmt(stats.ic_ir, 4)}
+            positive={above(stats.ic_ir, 0.3)}
           />
           <StatCell
-            label="t-stat" tip={METRIC_TIPS['t-stat']}
-            value={stats.t_stat.toFixed(2)}
-            positive={Math.abs(stats.t_stat) > 2}
+            label="t-stat (HAC)" tip={METRIC_TIPS['t-stat']}
+            value={fmt(stats.t_stat)}
+            positive={isNum(stats.t_stat) ? Math.abs(stats.t_stat) > 2 : undefined}
           />
           <StatCell
             label="% Positive" tip={METRIC_TIPS['% Positive']}
-            value={`${(stats.pct_positive * 100).toFixed(1)}%`}
-            positive={stats.pct_positive > 0.5}
+            value={pct(stats.pct_positive)}
+            positive={above(stats.pct_positive, 0.5)}
           />
           <StatCell
             label="N Periods" tip={METRIC_TIPS['N Periods']}
             value={String(stats.n_periods)}
+          />
+        </div>
+      </div>
+
+      {/* Overlap correction — the difference between "significant" and noise */}
+      <div className="card border border-slate-700/60">
+        <p className="text-xs font-semibold text-slate-300 mb-1">
+          Overlap Correction
+          <span className="text-[10px] text-slate-600 font-normal ml-2">
+            Newey-West, {stats.hac_lags} lags (horizon {stats.horizon}d)
+          </span>
+        </p>
+        <p className="text-[11px] text-slate-500 mb-4 leading-relaxed">
+          Consecutive daily cross-sections share {Math.max(stats.horizon - 1, 0)} of their{' '}
+          {stats.horizon} forward-return days, so the naive standard error is far too small.
+          Only the corrected figure is a real significance test.
+        </p>
+        <div className="grid grid-cols-3 gap-4">
+          <StatCell
+            label="Corrected" tip={METRIC_TIPS['t-stat']}
+            value={fmt(stats.t_stat)}
+            positive={isNum(stats.t_stat) ? Math.abs(stats.t_stat) > 2 : undefined}
+          />
+          <StatCell
+            label="Naive (do not quote)" tip={METRIC_TIPS['t-stat (naive)']}
+            value={fmt(stats.t_stat_naive)}
+          />
+          <StatCell
+            label="Inflation Factor"
+            value={inflation != null ? `${fmt(inflation, 1)}×` : '—'}
           />
         </div>
       </div>
@@ -225,16 +266,22 @@ function ICStatsCard({ stats }: { stats: ICStats }) {
           <p className="text-[11px] text-slate-500 mb-4 leading-relaxed">
             After controlling for all other stocks, does this factor earn a statistically significant extra return?
           </p>
-          <div className="grid grid-cols-2 gap-4">
+          <div className="grid grid-cols-3 gap-4">
             <StatCell
               label="Risk Premium (γ)" tip={METRIC_TIPS['Risk Premium (γ)']}
-              value={stats.fama_macbeth_gamma!.toFixed(6)}
-              positive={(stats.fama_macbeth_gamma ?? 0) > 0}
+              value={fmt(stats.fama_macbeth_gamma, 6)}
+              positive={above(stats.fama_macbeth_gamma, 0)}
             />
             <StatCell
-              label="FM t-stat" tip={METRIC_TIPS['FM t-stat']}
-              value={(stats.fama_macbeth_t_stat ?? 0).toFixed(2)}
-              positive={Math.abs(stats.fama_macbeth_t_stat ?? 0) > 2}
+              label="FM t-stat (HAC)" tip={METRIC_TIPS['FM t-stat']}
+              value={fmt(stats.fama_macbeth_t_stat)}
+              positive={isNum(stats.fama_macbeth_t_stat)
+                ? Math.abs(orZero(stats.fama_macbeth_t_stat)) > 2 : undefined}
+            />
+            <StatCell
+              label="p-value"
+              value={fmt(stats.fama_macbeth_p_value, 4)}
+              positive={below(stats.fama_macbeth_p_value, 0.05)}
             />
           </div>
         </div>

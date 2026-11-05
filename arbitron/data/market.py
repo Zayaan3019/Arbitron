@@ -63,12 +63,72 @@ SECTOR_UNIVERSES: dict[str, list[str]] = {
 }
 
 # Compact default universe — diverse, liquid, goes back to 2010
+#
+# WARNING — this list is NOT point-in-time.  See UNIVERSE_CAVEAT below.
 DEFAULT_UNIVERSE: list[str] = [
     "AAPL", "MSFT", "GOOGL", "AMZN", "NVDA", "META", "TSLA", "BRK-B",
     "JPM", "JNJ", "UNH", "V", "XOM", "PG", "HD", "MA", "BAC", "ABBV",
     "KO", "MRK", "PEP", "LLY", "AVGO", "COST", "MCD", "TMO", "WMT",
     "CSCO", "CVX", "ACN",
 ]
+
+
+# ---------------------------------------------------------------------------
+# Data limitations — surfaced in the README AND in every API response that
+# is derived from these universes.  Do not delete without shipping a
+# point-in-time membership table first.
+# ---------------------------------------------------------------------------
+
+UNIVERSE_CAVEAT: dict[str, object] = {
+    "point_in_time": False,
+    "survivorship_bias": True,
+    "headline": (
+        "Universes are TODAY's index members, not point-in-time membership. "
+        "Every backtest run on them is upward-biased."
+    ),
+    "details": [
+        "Survivorship bias: names that were delisted, acquired or bankrupted "
+        "during the backtest window are absent, so the realised loss from "
+        "holding them is never charged to the strategy.",
+        "Ex-post selection bias: DEFAULT_UNIVERSE is a hand-picked list of "
+        "mega-caps that are large TODAY. Membership itself encodes the "
+        "forward return being measured.",
+        "Sector universes carry the same two biases within their sector.",
+        "Consequence: treat absolute Sharpe/CAGR as an upper bound. "
+        "Cross-factor COMPARISONS on the same universe are far less affected "
+        "because every candidate inherits the same bias.",
+    ],
+    "remediation": (
+        "Supply an explicit point-in-time ticker list via the `tickers` field "
+        "to bypass the built-in universes entirely."
+    ),
+}
+
+
+def universe_caveat(universe: Optional[str] = None, tickers: Optional[list[str]] = None) -> dict:
+    """
+    Return the data-limitation block that belongs on any response derived
+    from a built-in universe.
+
+    When the caller supplied their own `tickers`, the built-in survivorship
+    caveat does not apply to the SELECTION (though it may still apply to the
+    caller's own list, which we cannot verify).
+    """
+    if tickers:
+        return {
+            "point_in_time": None,
+            "survivorship_bias": None,
+            "headline": (
+                "Caller-supplied ticker list. Arbitron cannot verify whether it "
+                "is point-in-time; if it was chosen with hindsight the results "
+                "carry the same selection bias as the built-in universes."
+            ),
+            "details": [],
+            "remediation": UNIVERSE_CAVEAT["remediation"],
+        }
+    caveat = dict(UNIVERSE_CAVEAT)
+    caveat["universe"] = universe or "SP500"
+    return caveat
 
 
 # ---------------------------------------------------------------------------
@@ -85,13 +145,19 @@ class MarketData:
     older than `refresh_days`.
     """
 
+    #: Maximum number of consecutive trading days a stale price may be carried
+    #: forward.  Sized for exchange holidays and short feed outages only.
+    FFILL_LIMIT: int = 5
+
     def __init__(
         self,
         cache_dir: str = "data/cache",
         refresh_days: int = 1,
+        ffill_limit: int = FFILL_LIMIT,
     ) -> None:
         self.cache_dir    = Path(cache_dir)
         self.refresh_days = refresh_days
+        self.ffill_limit  = ffill_limit
         self.cache_dir.mkdir(parents=True, exist_ok=True)
 
     # ------------------------------------------------------------------
@@ -108,12 +174,28 @@ class MarketData:
         """
         Return a (dates × tickers) DataFrame of adjusted closing prices.
 
-        NaN values are forward-filled then backward-filled (handles
-        trading-day gaps for non-US-listed tickers).
+        Gap handling — deliberately conservative, and load-bearing:
+
+        * Interior gaps are forward-filled for at most ``ffill_limit`` (5)
+          trading days.  That covers exchange holidays and short feed
+          outages and nothing else.
+        * **Leading NaNs are preserved.**  A ticker that had not yet listed
+          must stay NaN so every downstream layer excludes it.  Back-filling
+          (the previous behaviour) stamped the first post-IPO price across
+          all pre-IPO dates, manufacturing years of *exactly zero* returns —
+          which the low-vol factor then ranks as the single most attractive
+          name in the universe.
+        * **Trailing NaNs are preserved** past the fill limit.  Unbounded
+          forward-fill carries a delisted name's last quote forward forever,
+          so a company going to zero shows no loss at all.
+
+        Callers must therefore expect NaNs.  `run_factor_backtest`
+        renormalises over the names that are actually live on each date and
+        reports the rest via `BacktestResult.dropped_names`.
         """
         end = end or datetime.today().strftime("%Y-%m-%d")
         raw = self._fetch(tickers, start, end, field)
-        return raw.ffill().bfill()
+        return raw.ffill(limit=self.ffill_limit)
 
     def get_returns(
         self,
@@ -126,6 +208,9 @@ class MarketData:
         """
         Return (dates × tickers) simple or log returns, optionally resampled.
 
+        Missing prices stay missing: returns spanning a NaN price are NaN
+        rather than being silently bridged across the gap.
+
         Args:
             log:  If True return log returns; else simple returns.
             freq: Resample frequency — 'D' daily, 'W' weekly, 'ME' month-end.
@@ -135,7 +220,7 @@ class MarketData:
             prices = prices.resample(freq).last()
         if log:
             return np.log(prices / prices.shift(1)).dropna(how="all")
-        return prices.pct_change().dropna(how="all")
+        return to_returns(prices).dropna(how="all")
 
     def get_volume(
         self,
@@ -232,6 +317,20 @@ class MarketData:
 # ---------------------------------------------------------------------------
 # Convenience helpers
 # ---------------------------------------------------------------------------
+
+def to_returns(prices: pd.DataFrame | pd.Series, periods: int = 1):
+    """
+    Simple returns with **no implicit gap filling**.
+
+    `pandas.pct_change` historically pad-filled before differencing, which
+    silently bridges a missing price and reports a multi-day move as a
+    one-day move.  Since `MarketData.get_prices` now preserves genuine NaNs
+    (pre-IPO, post-delisting), every return computation in the repo must opt
+    out of that padding explicitly.  Use this helper instead of calling
+    `.pct_change()` directly.
+    """
+    return prices.pct_change(periods, fill_method=None)
+
 
 def align_dates(
     *frames: pd.DataFrame,

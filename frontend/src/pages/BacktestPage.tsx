@@ -6,6 +6,8 @@ import {
 } from 'recharts'
 import { api, BacktestResult } from '../api'
 import { useStore } from '../store'
+import { above, fmt, isNum, orZero, pct } from '../format'
+import DataCaveatNotice from '../components/DataCaveatNotice'
 import clsx from 'clsx'
 
 const FACTORS: Array<{ value: string; label: string }> = [
@@ -187,10 +189,11 @@ export default function BacktestPage() {
 function BacktestResultView({ result }: { result: BacktestResult }) {
   const m = result.metrics
 
-  // Strategy verdict
-  const score = (m.sharpe > 1 ? 2 : m.sharpe > 0.5 ? 1 : 0)
-              + (m.cagr > 0.1 ? 2 : m.cagr > 0 ? 1 : 0)
-              + (m.max_drawdown > -0.2 ? 1 : 0)
+  // Strategy verdict. A metric that is not evaluable scores zero rather than
+  // being read as a passing value.
+  const score = (above(m.sharpe, 1) ? 2 : above(m.sharpe, 0.5) ? 1 : 0)
+              + (above(m.cagr, 0.1) ? 2 : above(m.cagr, 0) ? 1 : 0)
+              + (above(m.max_drawdown, -0.2) ? 1 : 0)
   const verdict =
     score >= 4 ? { label: 'Strong Strategy',  color: 'text-green-400', bg: 'bg-green-950/30 border-green-800/40', icon: '🚀' }
     : score >= 2 ? { label: 'Decent Strategy', color: 'text-blue-400',  bg: 'bg-blue-950/30 border-blue-800/40',  icon: '✅' }
@@ -198,9 +201,11 @@ function BacktestResultView({ result }: { result: BacktestResult }) {
 
   const chartData = result.dates.map((d, i) => ({
     date: d.slice(0, 7),
-    cum:  +((result.cumulative_returns[i] - 1) * 100).toFixed(2),
-    dd:   +(result.drawdown[i] * 100).toFixed(2),
+    cum:  isNum(result.cumulative_returns[i]) ? +((orZero(result.cumulative_returns[i], 1) - 1) * 100).toFixed(2) : null,
+    dd:   isNum(result.drawdown[i]) ? +(orZero(result.drawdown[i]) * 100).toFixed(2) : null,
   }))
+
+  const droppedEntries = Object.entries(result.dropped_names ?? {})
 
   return (
     <div className="space-y-4">
@@ -211,26 +216,51 @@ function BacktestResultView({ result }: { result: BacktestResult }) {
           <div>
             <p className={clsx('text-sm font-bold', verdict.color)}>{verdict.label}</p>
             <p className="text-xs text-slate-400 mt-0.5">
-              {`${(m.cagr * 100).toFixed(1)}% annual return · ${m.sharpe.toFixed(2)} Sharpe · ${(m.max_drawdown * 100).toFixed(1)}% worst drawdown`}
+              {`${pct(m.cagr)} annual return · ${fmt(m.sharpe)} Sharpe · ${pct(m.max_drawdown)} worst drawdown`}
+            </p>
+            <p className="text-[10px] text-slate-600 mt-1">
+              {result.n_rebalances} rebalances · {m.n_periods} trading days
             </p>
           </div>
         </div>
       </div>
 
+      <DataCaveatNotice caveats={result.data_caveats} />
+
       {/* Metrics */}
       <div className="card">
         <p className="text-xs font-semibold text-slate-300 mb-4">Performance Metrics</p>
         <div className="grid grid-cols-4 gap-4">
-          <MetricTile label="CAGR"     tip={METRIC_TIPS['CAGR']}     value={`${(m.cagr*100).toFixed(1)}%`}      pos={m.cagr > 0} />
-          <MetricTile label="Sharpe"   tip={METRIC_TIPS['Sharpe']}   value={m.sharpe.toFixed(2)}                pos={m.sharpe > 0.5} />
-          <MetricTile label="Sortino"  tip={METRIC_TIPS['Sortino']}  value={m.sortino.toFixed(2)}               pos={m.sortino > 0.5} />
-          <MetricTile label="Calmar"   tip={METRIC_TIPS['Calmar']}   value={m.calmar.toFixed(2)}                pos={m.calmar > 0.5} />
-          <MetricTile label="Max DD"   tip={METRIC_TIPS['Max DD']}   value={`${(m.max_drawdown*100).toFixed(1)}%`} pos={false} />
-          <MetricTile label="Win Rate" tip={METRIC_TIPS['Win Rate']} value={`${(m.win_rate*100).toFixed(1)}%`} pos={m.win_rate > 0.5} />
-          <MetricTile label="Ann Vol"  tip={METRIC_TIPS['Ann Vol']}  value={`${(m.ann_volatility*100).toFixed(1)}%`} />
-          <MetricTile label="Skewness" tip={METRIC_TIPS['Skewness']} value={m.skewness.toFixed(2)}             pos={m.skewness > 0} />
+          <MetricTile label="CAGR"     tip={METRIC_TIPS['CAGR']}     value={pct(m.cagr)}          pos={above(m.cagr, 0)} />
+          <MetricTile label="Sharpe"   tip={METRIC_TIPS['Sharpe']}   value={fmt(m.sharpe)}        pos={above(m.sharpe, 0.5)} />
+          <MetricTile label="Sortino"  tip={METRIC_TIPS['Sortino']}  value={fmt(m.sortino)}       pos={above(m.sortino, 0.5)} />
+          <MetricTile label="Calmar"   tip={METRIC_TIPS['Calmar']}   value={fmt(m.calmar)}        pos={above(m.calmar, 0.5)} />
+          <MetricTile label="Max DD"   tip={METRIC_TIPS['Max DD']}   value={pct(m.max_drawdown)}  pos={isNum(m.max_drawdown) ? false : undefined} />
+          <MetricTile label="Win Rate" tip={METRIC_TIPS['Win Rate']} value={pct(m.win_rate)}      pos={above(m.win_rate, 0.5)} />
+          <MetricTile label="Ann Vol"  tip={METRIC_TIPS['Ann Vol']}  value={pct(m.ann_volatility)} />
+          <MetricTile label="Skewness" tip={METRIC_TIPS['Skewness']} value={fmt(m.skewness)}      pos={above(m.skewness, 0)} />
         </div>
       </div>
+
+      {droppedEntries.length > 0 && (
+        <div className="card border border-slate-700/60">
+          <p className="text-xs font-semibold text-slate-300 mb-1">Names dropped mid-holding</p>
+          <p className="text-[10px] text-slate-600 mb-3 leading-relaxed">
+            These positions stopped quoting during a holding period (delisting, halt, or a
+            gap longer than the 5-day fill limit). Each was removed from the book for the
+            affected days and its leg renormalised over the survivors — it did not sit in
+            the portfolio contributing a fake zero return.
+          </p>
+          <div className="flex flex-wrap gap-2">
+            {droppedEntries.map(([ticker, days]) => (
+              <span key={ticker} className="text-[11px] font-mono px-2 py-1 rounded-lg
+                                            bg-slate-800/60 border border-slate-700 text-slate-400">
+                {ticker} · {days}d
+              </span>
+            ))}
+          </div>
+        </div>
+      )}
 
       {/* Equity curve */}
       <div className="card">
@@ -243,10 +273,10 @@ function BacktestResultView({ result }: { result: BacktestResult }) {
             <YAxis tick={{ fill: '#64748b', fontSize: 11 }} tickFormatter={(v) => `${v}%`} />
             <Tooltip
               contentStyle={{ background: '#161b27', border: '1px solid #252d3d', fontSize: 12 }}
-              formatter={(v: number) => [`${v.toFixed(2)}%`, 'Return']}
+              formatter={(v: number) => [`${fmt(v)}%`, 'Return']}
             />
             <ReferenceLine y={0} stroke="#475569" strokeDasharray="3 3" />
-            <Line type="monotone" dataKey="cum" stroke="#4f72ff" dot={false} strokeWidth={2} />
+            <Line type="monotone" dataKey="cum" stroke="#4f72ff" dot={false} strokeWidth={2} connectNulls />
           </LineChart>
         </ResponsiveContainer>
       </div>
@@ -262,9 +292,9 @@ function BacktestResultView({ result }: { result: BacktestResult }) {
             <YAxis tick={{ fill: '#64748b', fontSize: 11 }} tickFormatter={(v) => `${v}%`} />
             <Tooltip
               contentStyle={{ background: '#161b27', border: '1px solid #252d3d', fontSize: 12 }}
-              formatter={(v: number) => [`${v.toFixed(2)}%`, 'Drawdown']}
+              formatter={(v: number) => [`${fmt(v)}%`, 'Drawdown']}
             />
-            <Line type="monotone" dataKey="dd" stroke="#f87171" dot={false} strokeWidth={1.5} />
+            <Line type="monotone" dataKey="dd" stroke="#f87171" dot={false} strokeWidth={1.5} connectNulls />
           </LineChart>
         </ResponsiveContainer>
       </div>
