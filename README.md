@@ -15,7 +15,7 @@ Arbitron is a full-stack quantitative research platform combining:
 - **Autonomous LLM Agent** — Llama 3.3 70B (via Groq free API) uses function calling in a ReAct loop to plan and execute research tasks end-to-end
 - **Quant Factor Library** — 13 named factors (momentum, reversal, volatility, RSI, MACD, Bollinger, price acceleration, ...)
 - **Walk-Forward Backtesting** — Purged and embargoed splits (López de Prado, 2018), quintile L/S portfolio with transaction costs
-- **Portfolio Optimization** — Mean-Variance (SLSQP), Max Sharpe (analytic + SLSQP), Risk Parity (ERC), Ledoit-Wolf covariance shrinkage
+- **Portfolio Optimization** — Mean-Variance (SLSQP), Max Sharpe (analytic + SLSQP), Risk Parity (ERC), Ledoit-Wolf (2004) constant-correlation shrinkage with the optimal intensity
 - **Risk Analytics** — VaR/CVaR (historical, parametric, Monte Carlo), factor decomposition, MRC/CRC, Ulcer Index
 - **Regime Detection** — Gaussian HMM on (return, log-vol) features, forward-filtered (no look-ahead); rule-based fallback (SMA + vol percentile)
 - **Trial Registry** — counts every strategy variant tested, so the Deflated Sharpe hurdle reflects the real number of trials
@@ -32,11 +32,12 @@ The new `/api/lab/run` workflow turns Arbitron into an autonomous quant research
 
 1. Computes a research queue of candidate factors.
 2. Builds an optional market-foundation signal from causal multi-scale price features.
-3. Runs walk-forward quintile backtests with transaction costs.
-4. Audits every candidate with PSR, DSR, PBO, drawdown, and sample-size gates.
-5. Checks whether performance survives bull/bear regime splits.
-6. Ranks candidates by a defense-aware research score.
-7. Returns a champion, candidate queue, foundation diagnostics, equity curve, and research memo.
+3. Runs walk-forward quintile backtests with transaction costs, each factor twice: always invested, and with **regime-gated entries** (the book goes flat, paying the exit cost, while a walk-forward, forward-filtered HMM puts the market in its risk-off state).
+4. Builds a **walk-forward IC-weighted composite** of the factors. Its weights are re-estimated monthly from past IC only, with a 21-day purge (the label length) and a 5-day embargo, so a weight never uses a return that was not yet observable.
+5. Audits every candidate with PSR, DSR, PBO, drawdown, and sample-size gates. Gated variants and the composite are separate trials, so they raise the Deflated Sharpe hurdle like any other backtest.
+6. Checks performance by regime, using the same causal HMM states as the gate.
+7. Ranks candidates by a defense-aware research score.
+8. Returns a champion, candidate queue, foundation diagnostics, equity curve, and research memo.
 
 This is designed to avoid the usual student-project trap: picking the prettiest backtest. The lab explicitly asks whether the result survives multiple-testing, overfitting, non-normal returns, and market-regime instability.
 
@@ -54,19 +55,20 @@ arbitron/
 │   │   └── market.py       # yfinance + Parquet cache, universe definitions
 │   ├── factors/
 │   │   ├── library.py      # 13 factors + FACTOR_REGISTRY
-│   │   └── evaluation.py   # IC, IC-IR, Fama-MacBeth (Newey-West HAC)
+│   │   ├── evaluation.py   # IC, IC-IR, Fama-MacBeth (Newey-West HAC)
+│   │   └── composite.py    # Walk-forward, purged + embargoed IC-weighted composite
 │   ├── backtest/
-│   │   ├── engine.py       # L/S quintile backtest + purged/embargoed walk-forward splitter
+│   │   ├── engine.py       # L/S quintile backtest (optional regime entry gate) + purged/embargoed splitter
 │   │   └── metrics.py      # Sharpe, Sortino, Calmar, CAGR, Omega Ratio, ...
 │   ├── portfolio/
-│   │   └── optimizer.py    # MVO, Max Sharpe, Risk Parity, efficient frontier
+│   │   └── optimizer.py    # MVO, Max Sharpe, Risk Parity, frontier, Ledoit-Wolf shrinkage
 │   ├── risk/
 │   │   └── analytics.py    # VaR, CVaR, MRC, CRC, factor beta, tail metrics
 │   ├── lab/
 │   │   ├── research_lab.py        # Research lab: candidates, gates, ranking, memo
 │   │   └── statistical_defense.py # PSR, DSR, PBO (CSCV), drawdown gate
 │   ├── models/
-│   │   ├── regime.py       # GaussianHMM (forward-filtered) + SimpleRegimeDetector
+│   │   ├── regime.py       # GaussianHMM (forward-filtered, walk-forward) + entry gate + rule-based fallback
 │   │   └── foundation.py   # Market-state embeddings + walk-forward Ridge adapter
 │   └── trials.py           # Trial registry feeding the Deflated Sharpe hurdle
 ├── api/
@@ -80,8 +82,9 @@ arbitron/
 │       ├── pages/          # Agent, Factors, Backtest, Portfolio, Risk, Lab
 │       ├── api.ts           # Typed API client + WebSocket helper
 │       └── store.ts         # Zustand global state
-├── tests/                  # 143 tests (factors, backtest, portfolio, risk, lab,
-│                           #   statistical defense, look-ahead, market data)
+├── tests/                  # 187 tests (factors, backtest, portfolio, risk, lab,
+│                           #   statistical defense, look-ahead, market data,
+│                           #   regime gate + composite causality, shrinkage, tool args)
 ├── research.py             # CLI entry point
 ├── render.yaml             # Render deployment (API)
 └── pyproject.toml
@@ -98,7 +101,7 @@ Arbitron now separates "looks good" from "survives audit":
 | Probabilistic Sharpe Ratio | Estimates whether Sharpe is statistically above a hurdle after skew/kurtosis adjustment |
 | Deflated Sharpe Ratio | Raises the Sharpe hurdle when many strategy variants were tested |
 | Probability of Backtest Overfitting | Uses CSCV-style train/test splits to measure if the selected champion collapses out of sample |
-| Regime Robustness | Reports strategy behavior in bull and bear regimes |
+| Regime Robustness | Reports strategy behavior in risk-on and risk-off regimes (causal HMM states; rule-based fallback if hmmlearn is absent) |
 | Drawdown Gate | Blocks high-Sharpe strategies that hide unacceptable path risk |
 
 ---
@@ -114,7 +117,7 @@ The local foundation module does not require PyTorch or paid model APIs. It lear
 - Cross-sectional rank/z-score structure
 - Date-level market breadth, dispersion, drawdown, skew, and kurtosis
 
-The learned latent state is used by a walk-forward Ridge adapter to predict cross-sectional forward returns. This gives Arbitron a foundation-model-style representation layer while keeping the project reproducible on a laptop.
+The learned latent state is used by a walk-forward Ridge adapter to predict cross-sectional forward returns. Training ends 21 + 21 days (purge + embargo) before each test block, and the Ridge penalty is chosen on forward-chaining **date** folds with a 21-day purge, not leave-one-out (which validates a row on neighbours whose 21-day labels overlap it). This gives Arbitron a foundation-model-style representation layer while keeping the project reproducible on a laptop.
 
 ---
 
@@ -143,7 +146,7 @@ Every setting is listed in `.env.example`.
 
 ```bash
 pytest tests/ -v
-# → 143 passed
+# → 187 passed
 ```
 
 ### 4. Start the API server
@@ -179,7 +182,7 @@ python research.py "Evaluate momentum and reversal factors; backtest the winner"
 
 ## Agent Tools
 
-The agent has access to 9 tools that map directly to the quant library:
+The agent has access to 9 tools that map directly to the quant library. Every call's arguments are validated before anything runs, by pydantic models generated from the same JSON schemas the model sees: unknown keys, wrong types, malformed or reversed dates, unknown factor names and out-of-range numbers come back as a precise error the agent can correct.
 
 | Tool | Description |
 |------|-------------|
@@ -223,7 +226,7 @@ The agent has access to 9 tools that map directly to the quant library:
 | `min_variance` | SLSQP | When return estimates are unreliable |
 | `risk_parity` | ERC (Maillard et al., 2010) | Robust, diversified |
 
-All use Ledoit-Wolf shrinkage covariance (sklearn) by default. Weights are clipped at zero only for long-only books and are always renormalised to sum to 1, so a long-short solution keeps its short leg.
+All use Ledoit-Wolf shrinkage covariance by default: the Ledoit & Wolf (2004) constant-correlation target (sample variances, one average correlation) with the paper's optimal shrinkage intensity, checked in the tests against a loop-by-loop transcription of the paper's formulas. `target="identity"` gives sklearn's scaled-identity version, which ignores that stocks are correlated. Weights are clipped at zero only for long-only books and are always renormalised to sum to 1, so a long-short solution keeps its short leg.
 
 ---
 

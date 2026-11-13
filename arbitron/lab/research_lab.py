@@ -15,10 +15,11 @@ from arbitron.factors.evaluation import (
     ic_stats,
     information_coefficient,
 )
+from arbitron.factors.composite import walk_forward_composite
 from arbitron.factors.library import FACTOR_REGISTRY, compute_factor
 from arbitron.lab.statistical_defense import StatisticalDefenseConfig, audit_strategy
 from arbitron.models.foundation import MarketFoundationConfig, build_foundation_signal
-from arbitron.models.regime import SimpleRegimeDetector
+from arbitron.models.regime import SimpleRegimeDetector, hmm_entry_gate
 from arbitron.trials import TRIALS
 
 
@@ -43,9 +44,18 @@ def run_flagship_research_lab(
     n_quantiles: int = 5,
     transaction_cost: float = 0.001,
     max_factors: int = 9,
+    regime_gate: bool = True,
+    include_composite: bool = True,
 ) -> dict[str, Any]:
     """
     Run factor discovery, statistical defenses, and foundation-signal research.
+
+    regime_gate:       also backtest every factor with regime-gated entries
+                       (book flat while the causal, walk-forward HMM puts the
+                       market in its risk-off state). Each gated run is a
+                       separate trial, so the Deflated Sharpe pays for it.
+    include_composite: add the walk-forward, purged IC-weighted composite of
+                       the lab's factors as a candidate.
 
     The return value is JSON-friendly and designed for both the FastAPI router
     and the autonomous agent tool.
@@ -63,28 +73,98 @@ def run_flagship_research_lab(
     returns_by_strategy: dict[str, pd.Series] = {}
     equity_by_strategy: dict[str, pd.Series] = {}
     foundation_payload: dict[str, Any] = {"enabled": False}
+    computed: dict[str, pd.DataFrame] = {}
+
+    # One causal regime history for the whole run: the HMM is refit
+    # walk-forward and forward-filtered, so each date's state uses only data
+    # up to that date. It drives the entry gate and the regime breakdown.
+    regime_payload: dict[str, Any] = {"enabled": False}
+    gate: Optional[pd.Series] = None
+    regime_labels: Optional[pd.Series] = None
+    try:
+        gate_frame = hmm_entry_gate(prices)
+        if not gate_frame.empty:
+            gate = gate_frame["allow"]
+            regime_labels = gate_frame["allow"].map({True: "Risk-on", False: "Risk-off"})
+            regime_payload = {
+                "enabled": True,
+                "model": "2-state Gaussian HMM, walk-forward refit, forward-filtered",
+                "first_label": str(gate_frame.index[0].date()),
+                "risk_off_share": round(float((~gate_frame["allow"]).mean()), 4),
+            }
+    except Exception as exc:
+        regime_payload = {"enabled": False, "error": str(exc)}
 
     for name in factor_names:
         try:
             factor = compute_factor(name, prices)
+            computed[name] = factor
             result = run_factor_backtest(factor, prices, cfg, factor_name=name)
             if result.returns.empty:
                 continue
             eval_stats = factor_summary(name, factor, prices, horizon)
+            evaluation = _select_evaluation_stats(eval_stats)
             returns_by_strategy[name] = result.returns.rename(name)
             equity_by_strategy[name] = result.cumulative.rename(name)
             candidates.append({
                 "name": name,
                 "kind": "factor",
-                "evaluation": _select_evaluation_stats(eval_stats),
+                "evaluation": evaluation,
                 "metrics": _metrics_payload(result.returns),
             })
+            if regime_gate and gate is not None:
+                gated_name = f"{name}+hmm_gate"
+                gated = run_factor_backtest(
+                    factor, prices, cfg, factor_name=gated_name, entry_gate=gate,
+                )
+                if not gated.returns.empty:
+                    returns_by_strategy[gated_name] = gated.returns.rename(gated_name)
+                    equity_by_strategy[gated_name] = gated.cumulative.rename(gated_name)
+                    candidates.append({
+                        "name": gated_name,
+                        "kind": "factor_regime_gated",
+                        "evaluation": evaluation,
+                        "metrics": _metrics_payload(gated.returns),
+                        "gate": {
+                            "rebalances_traded": gated.n_rebalances,
+                            "rebalances_flat": gated.n_gated_off,
+                        },
+                    })
         except Exception as exc:
             candidates.append({
                 "name": name,
                 "kind": "factor",
                 "error": str(exc),
             })
+
+    if include_composite and len(computed) >= 2:
+        try:
+            comp = walk_forward_composite(computed, prices, horizon=horizon)
+            if not comp.signal.empty:
+                cname = "wf_composite"
+                result = run_factor_backtest(comp.signal, prices, cfg, factor_name=cname)
+                if not result.returns.empty:
+                    returns_by_strategy[cname] = result.returns.rename(cname)
+                    equity_by_strategy[cname] = result.cumulative.rename(cname)
+                    fwd = forward_returns(prices, horizon)
+                    ic = information_coefficient(comp.signal, fwd)
+                    last_weights = (
+                        comp.weights.iloc[-1].round(4).to_dict() if not comp.weights.empty else {}
+                    )
+                    candidates.append({
+                        "name": cname,
+                        "kind": "walk_forward_composite",
+                        "evaluation": {
+                            **{f"ic_{k}": v for k, v in ic_stats(ic, horizon=horizon).items()},
+                            "fm_t_stat": None,
+                            "q5_minus_q1_mean": None,
+                        },
+                        "metrics": _metrics_payload(result.returns),
+                        "composite": {**comp.diagnostics, "latest_weights": last_weights},
+                    })
+        except Exception as exc:
+            candidates.append({"name": "wf_composite", "kind": "walk_forward_composite",
+                               "error": str(exc)})
 
     if include_foundation:
         try:
@@ -165,7 +245,9 @@ def run_flagship_research_lab(
             n_trials=n_trials,
         )
         candidate["audit"] = audit
-        candidate["regime_robustness"] = _regime_robustness(returns_matrix[name], prices)
+        candidate["regime_robustness"] = _regime_robustness(
+            returns_matrix[name], prices, regime_labels,
+        )
         candidate["research_score"] = _research_score(candidate)
         audited.append(_json_clean(candidate))
 
@@ -217,6 +299,7 @@ def run_flagship_research_lab(
             ),
         },
         "foundation": foundation_payload,
+        "regime_model": regime_payload,
         "champion_equity_curve": equity_curve,
         "research_memo": memo,
     })
@@ -245,11 +328,22 @@ def _metrics_payload(returns: pd.Series) -> dict[str, Any]:
     }
 
 
-def _regime_robustness(strategy_returns: pd.Series, prices: pd.DataFrame) -> dict[str, Any]:
-    returns = prices.pct_change(fill_method=None).dropna(how="all")
-    market_ret = returns.mean(axis=1)
-    detector = SimpleRegimeDetector()
-    labels = detector.fit(market_ret).predict(market_ret)
+def _regime_robustness(
+    strategy_returns: pd.Series,
+    prices: pd.DataFrame,
+    labels: Optional[pd.Series] = None,
+) -> dict[str, Any]:
+    """Performance split by regime.
+
+    Uses the causal walk-forward HMM labels when the lab has them (the same
+    states that drive the entry gate); the rule-based trend/vol detector is
+    only a fallback when the HMM could not be fitted.
+    """
+    if labels is None:
+        returns = prices.pct_change(fill_method=None).dropna(how="all")
+        market_ret = returns.mean(axis=1)
+        detector = SimpleRegimeDetector()
+        labels = detector.fit(market_ret).predict(market_ret)
     aligned = pd.DataFrame({
         "strategy": strategy_returns,
         "regime": labels.reindex(strategy_returns.index),

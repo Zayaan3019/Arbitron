@@ -198,7 +198,14 @@ def build_foundation_signal(
         Z_train = pca.fit_transform(Xs_train)
         Z_test = pca.transform(Xs_test)
 
-        model = RidgeCV(alphas=(0.01, 0.1, 1.0, 10.0, 100.0))
+        # The penalty is chosen on time-ordered folds with a purge of
+        # `horizon` days, not RidgeCV's default leave-one-out: LOO validates a
+        # row on neighbours whose 21-day labels overlap it, which rewards
+        # under-regularised fits.
+        splits = purged_date_splits(
+            X_train.index.get_level_values("date").values, n_splits=4, purge=cfg.horizon,
+        )
+        model = RidgeCV(alphas=(0.01, 0.1, 1.0, 10.0, 100.0), cv=splits or None)
         model.fit(np.column_stack([Xs_train, Z_train]), y_train.values)
         preds = model.predict(np.column_stack([Xs_test, Z_test]))
         pred_s = pd.Series(preds, index=X_test.index)
@@ -265,3 +272,34 @@ def _stack_frame(frame: pd.DataFrame) -> pd.Series:
         return frame.stack(future_stack=True)
     except TypeError:
         return frame.stack(dropna=False)
+
+
+def purged_date_splits(
+    row_dates: np.ndarray,
+    n_splits:  int = 4,
+    purge:     int = 21,
+) -> list[tuple[np.ndarray, np.ndarray]]:
+    """
+    Forward-chaining CV folds over a (date, ticker) panel, split by DATE.
+
+    The unique dates are cut into `n_splits + 1` contiguous blocks. Fold k
+    validates on block k and trains on every date at least `purge` trading
+    days before the block starts, so no training label (a `purge`-day forward
+    return) overlaps the validation period. Rows of one date never straddle
+    train and validation.
+    """
+    dates = np.asarray(row_dates)
+    uniq = np.unique(dates)
+    if len(uniq) < (n_splits + 1) * 2:
+        return []
+    blocks = np.array_split(uniq, n_splits + 1)
+    folds: list[tuple[np.ndarray, np.ndarray]] = []
+    for block in blocks[1:]:
+        cutoff = int(np.searchsorted(uniq, block[0])) - purge
+        if cutoff <= 0:
+            continue
+        train = np.flatnonzero(np.isin(dates, uniq[:cutoff]))
+        valid = np.flatnonzero(np.isin(dates, block))
+        if len(train) and len(valid):
+            folds.append((train, valid))
+    return folds

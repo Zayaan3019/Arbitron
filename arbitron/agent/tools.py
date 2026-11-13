@@ -15,10 +15,12 @@ functions and returns structured JSON results.
 from __future__ import annotations
 
 import json
-from typing import Any
+from functools import lru_cache
+from typing import Any, Literal, Optional
 
 import numpy as np
 import pandas as pd
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, create_model
 
 
 # ---------------------------------------------------------------------------
@@ -294,7 +296,18 @@ def execute_tool(
 
     Returns a dict that will be serialised as the tool_result content.
     On error, returns {"error": message} so the agent can recover.
+
+    Arguments are validated against the tool's JSON schema first (unknown
+    keys, wrong types, malformed dates, unknown factors and out-of-range
+    numbers are rejected), so a malformed call comes back as a precise error
+    the model can correct, never as a half-run tool with silent defaults.
     """
+    if tool_name not in _SCHEMA_BY_NAME:
+        return {"error": f"Unknown tool: {tool_name}"}
+    try:
+        tool_input = validate_tool_args(tool_name, tool_input)
+    except ToolArgumentError as e:
+        return {"error": str(e), "tool": tool_name, "invalid_arguments": True}
     try:
         if tool_name == "fetch_universe":
             return _tool_fetch_universe(tool_input, cache_dir)
@@ -318,6 +331,120 @@ def execute_tool(
             return {"error": f"Unknown tool: {tool_name}"}
     except Exception as e:
         return {"error": str(e), "tool": tool_name}
+
+
+# ---------------------------------------------------------------------------
+# Argument validation (pydantic models generated from TOOL_SCHEMAS)
+# ---------------------------------------------------------------------------
+
+class ToolArgumentError(ValueError):
+    """A tool call whose arguments do not match the tool's schema."""
+
+
+_SCHEMA_BY_NAME: dict[str, dict] = {
+    t["function"]["name"]: t["function"]["parameters"] for t in TOOL_SCHEMAS
+}
+
+_DATE_PATTERN = r"^\d{4}-\d{2}-\d{2}$"
+
+#: Bounds the JSON schemas only state in prose.
+_BOUNDS: dict[str, dict[str, Any]] = {
+    "n":                    {"ge": 1, "le": 30},
+    "horizon_days":         {"ge": 1, "le": 252},
+    "lookback_days":        {"ge": 21, "le": 5040},
+    "transaction_cost_bps": {"ge": 0, "le": 500},
+    "tickers":              {"min_length": 1, "max_length": 200},
+    "factor_names":         {"min_length": 1, "max_length": 20},
+}
+
+
+def _annotation(spec: dict) -> Any:
+    kind = spec.get("type")
+    if "enum" in spec:
+        return Literal[tuple(spec["enum"])]
+    if kind == "string":
+        return str
+    if kind == "integer":
+        return int
+    if kind == "number":
+        return float
+    if kind == "boolean":
+        return bool
+    if kind == "array":
+        return list[_annotation(spec.get("items", {}))]
+    if kind == "object":
+        return dict[str, _annotation(spec.get("additionalProperties", {}))]
+    return Any
+
+
+@lru_cache(maxsize=None)
+def _args_model(tool_name: str) -> type[BaseModel]:
+    params = _SCHEMA_BY_NAME[tool_name]
+    required = set(params.get("required", []))
+    fields: dict[str, Any] = {}
+    for name, spec in params.get("properties", {}).items():
+        ann = _annotation(spec)
+        kw = dict(_BOUNDS.get(name, {}))
+        if name.endswith("_date"):
+            kw["pattern"] = _DATE_PATTERN
+        if name in required:
+            fields[name] = (ann, Field(**kw))
+        else:
+            fields[name] = (Optional[ann], Field(default=None, **kw))
+    return create_model(
+        f"{tool_name}_args",
+        __config__=ConfigDict(extra="forbid"),
+        **fields,
+    )
+
+
+def validate_tool_args(tool_name: str, tool_input: Any) -> dict[str, Any]:
+    """
+    Check a tool call's arguments against its schema.
+
+    Returns only the arguments the caller actually set (coerced to the
+    schema's types), so each tool's own defaults still apply to the rest.
+    Raises ToolArgumentError with every problem listed.
+    """
+    if tool_input is None:
+        tool_input = {}
+    if not isinstance(tool_input, dict):
+        raise ToolArgumentError(
+            f"arguments for {tool_name} must be a JSON object, got {type(tool_input).__name__}"
+        )
+    # An explicit null means "not given" (models often send it for optionals).
+    given = {k: v for k, v in tool_input.items() if v is not None}
+    try:
+        args = _args_model(tool_name).model_validate(given)
+    except ValidationError as exc:
+        problems = "; ".join(
+            f"{'.'.join(str(p) for p in err['loc']) or '(root)'}: {err['msg']}"
+            for err in exc.errors()
+        )
+        raise ToolArgumentError(f"invalid arguments for {tool_name}: {problems}") from None
+    out = args.model_dump(exclude_unset=True)
+
+    from arbitron.factors.library import FACTOR_REGISTRY
+    names = ([out["factor_name"]] if "factor_name" in out else []) + list(out.get("factor_names", []))
+    unknown = [n for n in names if n not in FACTOR_REGISTRY]
+    if unknown:
+        raise ToolArgumentError(
+            f"invalid arguments for {tool_name}: unknown factor(s) {unknown}; "
+            f"choose from {sorted(FACTOR_REGISTRY)}"
+        )
+    for key in ("start_date", "end_date"):
+        if key in out:
+            try:
+                pd.Timestamp(out[key])
+            except (ValueError, TypeError):
+                raise ToolArgumentError(
+                    f"invalid arguments for {tool_name}: {key}={out[key]!r} is not a real date"
+                ) from None
+    if "start_date" in out and "end_date" in out and out["end_date"] <= out["start_date"]:
+        raise ToolArgumentError(
+            f"invalid arguments for {tool_name}: end_date must be after start_date"
+        )
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -490,11 +617,20 @@ def _tool_compute_risk(inp: dict, cache_dir: str) -> dict:
         returns = returns[returns.index <= pd.Timestamp(end)]
     mkt_ret = returns.mean(axis=1)
 
+    missing: list[str] = []
     if weights_inp:
-        w = pd.Series(weights_inp)
-        w = w / w.sum()
-        common = w.index.intersection(returns.columns)
-        port_ret = returns[common].multiply(w.reindex(common), axis=1).sum(axis=1)
+        w = pd.Series(weights_inp, dtype=float)
+        missing = sorted(set(w.index) - set(returns.columns))
+        w = w.drop(missing)
+        if w.empty:
+            raise ValueError(f"none of the weighted tickers have data: {missing}")
+        # Scale by gross exposure, not the net sum: a long-short book nets to
+        # ~0 and dividing by it would blow the weights up.
+        gross = w.abs().sum()
+        if gross == 0:
+            raise ValueError("weights are all zero")
+        w = w / gross
+        port_ret = returns[w.index].multiply(w, axis=1).sum(axis=1, min_count=1).dropna()
     else:
         port_ret = returns.mean(axis=1)
 
@@ -503,6 +639,7 @@ def _tool_compute_risk(inp: dict, cache_dir: str) -> dict:
     vt      = var_table(port_ret).to_dict(orient="records")
 
     return {
+        **({"ignored_tickers_without_data": missing} if missing else {}),
         "portfolio_metrics": _clean_dict(perf),
         "risk_report":       _clean_dict(risk),
         "var_table":         vt,

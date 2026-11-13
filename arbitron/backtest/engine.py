@@ -67,6 +67,9 @@ class BacktestResult:
     dropped_names:  dict = field(default_factory=dict)
     #: Number of rebalance dates the engine actually traded.
     n_rebalances:   int = 0
+    #: Rebalance dates on which the entry gate was closed and the book was
+    #: flat (0 when no gate was given).
+    n_gated_off:    int = 0
 
     def summary(self) -> dict:
         return {
@@ -79,6 +82,7 @@ class BacktestResult:
             "win_rate":      self.metrics.win_rate,
             "n_days":        self.metrics.n_days,
             "n_rebalances":  self.n_rebalances,
+            "n_gated_off":   self.n_gated_off,
             "dropped_names": self.dropped_names,
         }
 
@@ -92,6 +96,7 @@ def run_factor_backtest(
     prices:      pd.DataFrame,
     cfg:         Optional[BacktestConfig] = None,
     factor_name: str = "factor",
+    entry_gate:  Optional[pd.Series] = None,
 ) -> BacktestResult:
     """
     Quintile long-short factor backtest.
@@ -110,10 +115,19 @@ def run_factor_backtest(
     exactly zero return.  Every drop is reported in
     `BacktestResult.dropped_names`.
 
+    Regime gate: `entry_gate` is a boolean series by date (True = may hold
+    positions). At each rebalance the gate is read as of that date -- the
+    same information set as the factor -- and when it is closed the book
+    goes flat for the period: the exit pays its turnover cost, and the
+    period earns zero. A date with no gate value is treated as closed: a
+    gate that has no opinion yet must not open the book. Build one with
+    `arbitron.models.regime.hmm_entry_gate` (causal, walk-forward HMM).
+
     Args:
         factor:  (dates × tickers) factor values (raw, not yet ranked).
         prices:  (dates × tickers) adjusted close prices.
         cfg:     Backtest configuration (defaults used if None).
+        entry_gate: optional causal boolean gate, see above.
 
     Returns:
         BacktestResult with full metrics and time series.
@@ -136,6 +150,13 @@ def run_factor_backtest(
     weights_store:  dict[pd.Timestamp, pd.Series] = {}
     dropped_names:  dict[str, int] = {}
     prev_weights:   Optional[pd.Series] = None
+    n_gated_off = 0
+    gate = None
+    if entry_gate is not None:
+        # NaN is "unknown", which must read as closed: a plain astype(bool)
+        # would turn it into True.
+        gate = entry_gate.where(entry_gate.notna(), False).astype(bool).sort_index()
+        gate.index = pd.to_datetime(gate.index)
 
     for i, rebal in enumerate(rebal_dates[:-1]):
         next_rebal = rebal_dates[i + 1]
@@ -145,6 +166,27 @@ def run_factor_backtest(
             continue
         f_row = factor.loc[rebal].dropna()
         if len(f_row) < cfg.n_quantiles * 2:
+            continue
+
+        if gate is not None and not _gate_open(gate, rebal):
+            # Closed gate: hold nothing until the next rebalance.
+            hold_dates = returns.index[
+                (returns.index > rebal) & (returns.index <= next_rebal)
+            ]
+            if hold_dates.empty:
+                continue
+            n_gated_off += 1
+            exit_cost = 0.0
+            if prev_weights is not None:
+                exit_cost = cfg.transaction_cost * prev_weights.abs().sum()
+            flat = pd.Series(0.0, index=hold_dates)
+            flat.iloc[0] -= exit_cost
+            # An empty book, not "no history": re-entering when the gate
+            # reopens then pays full turnover, and a second closed period in a
+            # row pays no second exit.
+            prev_weights = pd.Series(dtype=float)
+            for day, r in flat.items():
+                strat_returns.append((day, r))
             continue
 
         # Compute quintile weights
@@ -205,6 +247,7 @@ def run_factor_backtest(
             config=cfg,
             dropped_names=dropped_names,
             n_rebalances=0,
+            n_gated_off=n_gated_off,
         )
 
     ret_series = (
@@ -244,7 +287,14 @@ def run_factor_backtest(
         config=cfg,
         dropped_names=dict(sorted(dropped_names.items(), key=lambda kv: -kv[1])),
         n_rebalances=len(weights_store),
+        n_gated_off=n_gated_off,
     )
+
+
+def _gate_open(gate: pd.Series, when: pd.Timestamp) -> bool:
+    """Gate value as of `when` (last value on or before it); none yet = closed."""
+    upto = gate.loc[:when]
+    return bool(upto.iloc[-1]) if len(upto) else False
 
 
 # ---------------------------------------------------------------------------

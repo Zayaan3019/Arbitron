@@ -58,3 +58,24 @@ def test_foundation_signal_produces_panel(prices):
     assert isinstance(result.signal, pd.DataFrame)
     assert result.diagnostics["asset_features"]
     assert "state_explained_variance" in result.diagnostics
+
+
+def test_low_drawdown_cannot_stand_in_for_evidence():
+    """No skill (PSR fails) is a reject even when only two gates fail.
+
+    A strategy that is mostly flat has a small drawdown and passes that gate;
+    before this rule it could reach the watchlist on drawdown and sample
+    length alone.
+    """
+    rng = np.random.default_rng(21)
+    idx = pd.bdate_range("2019-01-01", periods=600)
+    flat_noise = pd.Series(rng.normal(0.0, 0.002, len(idx)), index=idx)   # tiny, no edge
+    peers = pd.DataFrame({
+        "strategy": flat_noise,
+        "peer": rng.normal(0.0, 0.002, len(idx)),
+    }, index=idx)
+    report = audit_strategy(flat_noise, peers, "strategy")
+    gates = {g["name"]: g["pass"] for g in report["gates"]}
+    assert gates["Probabilistic Sharpe"] is False
+    assert gates["Drawdown Loss"] is True
+    assert report["verdict"] == "reject"

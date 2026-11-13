@@ -306,9 +306,15 @@ def audit_strategy(
 
     failed = [g["name"] for g in gates if g["pass"] is False]
     soft_failed = [g["name"] for g in gates if g["pass"] is None]
+    # Watchlist means "real on its own, but not yet good enough": at most two
+    # gates failed AND the single-test evidence (PSR) passed. Counting failed
+    # gates alone let practical gates stand in for evidence: a regime-gated
+    # variant sits flat a third of the time, so it passes the drawdown gate,
+    # and with PSR and DSR both failing it still reached the watchlist.
+    has_evidence = next(g for g in gates if g["name"] == "Probabilistic Sharpe")["pass"] is True
     if not failed and not soft_failed:
         verdict = "deployable"
-    elif len(failed) <= 2:
+    elif len(failed) <= 2 and has_evidence:
         verdict = "watchlist"
     else:
         verdict = "reject"

@@ -488,3 +488,44 @@ def build_regime_detector(use_hmm: bool = True, **kwargs):
         except ImportError:
             pass
     return SimpleRegimeDetector(**kwargs)
+
+
+# ---------------------------------------------------------------------------
+# Regime-gated entries
+# ---------------------------------------------------------------------------
+
+def market_proxy_returns(prices: pd.DataFrame) -> pd.Series:
+    """Equal-weight daily return of the universe: the market the HMM watches."""
+    return prices.sort_index().pct_change(fill_method=None).mean(axis=1, skipna=True).dropna()
+
+
+def hmm_entry_gate(
+    prices:         pd.DataFrame,
+    risk_off_state: str   = "Bear",
+    max_risk_off:   float = 0.5,
+    min_train:      int   = 252,
+    refit_freq:     int   = 63,
+    random_state:   int   = 42,
+) -> pd.DataFrame:
+    """
+    Causal entry gate from the walk-forward HMM.
+
+    The HMM is refit on an expanding window that ends before each block and
+    its states are forward-FILTERED (`RegimeDetector.predict_walk_forward`),
+    so the posterior on date t uses returns up to t only -- the same
+    information a rebalance at t's close has. The gate is open when the
+    filtered probability of the risk-off state is at most `max_risk_off`.
+
+    Returns a DataFrame indexed by date with columns ``p_risk_off`` and
+    ``allow`` (bool). Dates before the first fit are absent; the backtest
+    treats a missing gate as closed.
+    """
+    detector = RegimeDetector(n_components=2, random_state=random_state)
+    history = detector.predict_walk_forward(
+        market_proxy_returns(prices), min_train=min_train, refit_freq=refit_freq,
+    )
+    column = f"p_{risk_off_state}"
+    if history.empty or column not in history:
+        return pd.DataFrame(columns=["p_risk_off", "allow"])
+    p_off = history[column].astype(float)
+    return pd.DataFrame({"p_risk_off": p_off, "allow": p_off <= max_risk_off})

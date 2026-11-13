@@ -33,43 +33,120 @@ def sample_covariance(returns: pd.DataFrame, ann_factor: int = 252) -> pd.DataFr
     return returns.dropna().cov() * ann_factor
 
 
-def ledoit_wolf_covariance(returns: pd.DataFrame, ann_factor: int = 252) -> pd.DataFrame:
+def ledoit_wolf_covariance(
+    returns:    pd.DataFrame,
+    ann_factor: int = 252,
+    target:     str = "constant_correlation",
+) -> pd.DataFrame:
     """
-    Ledoit-Wolf shrinkage covariance estimator.
+    Ledoit-Wolf shrinkage covariance with the optimal shrinkage intensity.
 
-    Shrinks the sample covariance towards a scaled identity matrix
-    with optimal shrinkage intensity estimated analytically.
-    This dramatically reduces estimation error for N > 20 assets.
+    target="constant_correlation" (default): Ledoit & Wolf (2004), "Honey, I
+        Shrunk the Sample Covariance Matrix". Shrinks towards a matrix with
+        the sample variances on the diagonal and one average correlation off
+        it. Stocks really are positively correlated, so this target keeps the
+        market factor that a scaled identity throws away.
+    target="identity": Ledoit & Wolf (2004, JMVA) towards a scaled identity
+        (sklearn's LedoitWolf), kept for comparison.
+
+    The intensity is estimated from the data in both cases, not chosen.
     """
-    from sklearn.covariance import LedoitWolf
-    r = returns.dropna().values
-    lw = LedoitWolf()
-    lw.fit(r)
-    cov = lw.covariance_ * ann_factor
-    return pd.DataFrame(cov, index=returns.columns, columns=returns.columns)
+    if target == "identity":
+        from sklearn.covariance import LedoitWolf
+        r = returns.dropna().values
+        cov = LedoitWolf().fit(r).covariance_ * ann_factor
+        return pd.DataFrame(cov, index=returns.columns, columns=returns.columns)
+    if target != "constant_correlation":
+        raise ValueError(f"unknown shrinkage target {target!r}")
+    cov, _ = _constant_correlation_lw(returns.dropna().values)
+    return pd.DataFrame(cov * ann_factor, index=returns.columns, columns=returns.columns)
 
 
 def constant_correlation_shrinkage(
-    returns: pd.DataFrame,
+    returns:    pd.DataFrame,
     ann_factor: int = 252,
-    alpha: float = 0.5,
+    alpha:      Optional[float] = None,
 ) -> pd.DataFrame:
     """
     Constant-correlation shrinkage (Ledoit & Wolf, 2004 target).
 
     F = D^{1/2} * R_bar * D^{1/2}
     where D = diag of sample variances, R_bar = average off-diagonal correlation.
+
+    alpha=None (default) uses the optimal intensity from the paper; a number
+    in [0, 1] forces that intensity instead.
     """
-    S = returns.dropna().cov() * ann_factor
-    vols = np.sqrt(np.diag(S.values))
-    C    = S.values / np.outer(vols, vols)   # correlation matrix
-    n    = len(C)
-    off  = (C.sum() - np.trace(C)) / (n * (n - 1))
-    C_target = np.full_like(C, off)
-    np.fill_diagonal(C_target, 1.0)
-    F = np.outer(vols, vols) * C_target
-    shrunk = alpha * F + (1 - alpha) * S.values
-    return pd.DataFrame(shrunk, index=returns.columns, columns=returns.columns)
+    x = returns.dropna().values
+    sample, shrink_opt = _constant_correlation_lw(x, return_parts=True)
+    if alpha is None:
+        cov = sample
+    else:
+        if not 0.0 <= alpha <= 1.0:
+            raise ValueError("alpha must be in [0, 1]")
+        S, F = shrink_opt
+        cov = alpha * F + (1 - alpha) * S
+    return pd.DataFrame(cov * ann_factor, index=returns.columns, columns=returns.columns)
+
+
+def lw_shrinkage_intensity(returns: pd.DataFrame) -> float:
+    """The optimal constant-correlation shrinkage intensity (diagnostic)."""
+    return float(_lw_cc_parts(returns.dropna().values)[2])
+
+
+def _lw_cc_parts(x: np.ndarray) -> tuple[np.ndarray, np.ndarray, float]:
+    """
+    Sample covariance S, constant-correlation target F and the optimal
+    intensity delta, following Ledoit & Wolf (2004), section 2 and appendix
+    B (the authors' covCor.m):
+
+        delta = max(0, min(1, (pi - rho) / gamma / T))
+
+    pi    = sum of asymptotic variances of the sample covariances,
+    rho   = sum of asymptotic covariances between target and sample entries,
+    gamma = squared Frobenius distance between target and sample.
+    """
+    x = np.asarray(x, dtype=float)
+    t, n = x.shape
+    if t < 2:
+        raise ValueError("need at least two observations")
+    y = x - x.mean(axis=0)
+    S = y.T @ y / t
+    var = np.diag(S).copy()
+    if np.any(var <= 0):
+        raise ValueError("an asset has zero variance")
+    sd = np.sqrt(var)
+    if n == 1:
+        return S, S.copy(), 0.0
+    corr = S / np.outer(sd, sd)
+    r_bar = (corr.sum() - n) / (n * (n - 1))
+    F = r_bar * np.outer(sd, sd)
+    np.fill_diagonal(F, var)
+
+    y2 = y ** 2
+    pi_mat = y2.T @ y2 / t - S ** 2
+    pi_hat = pi_mat.sum()
+
+    gamma_hat = np.sum((F - S) ** 2)
+
+    rho_diag = np.trace(pi_mat)
+    theta = (y ** 3).T @ y / t - var[:, None] * S
+    np.fill_diagonal(theta, 0.0)
+    rho_off = r_bar * np.sum(np.outer(1.0 / sd, sd) * theta)
+    rho_hat = rho_diag + rho_off
+
+    if gamma_hat <= 0:
+        return S, F, 1.0          # sample already equals the target
+    kappa = (pi_hat - rho_hat) / gamma_hat
+    delta = float(max(0.0, min(1.0, kappa / t)))
+    return S, F, delta
+
+
+def _constant_correlation_lw(x: np.ndarray, return_parts: bool = False):
+    S, F, delta = _lw_cc_parts(x)
+    shrunk = delta * F + (1.0 - delta) * S
+    if return_parts:
+        return shrunk, (S, F)
+    return shrunk, delta
 
 
 # ---------------------------------------------------------------------------
