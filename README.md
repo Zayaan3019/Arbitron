@@ -1,6 +1,6 @@
 # Arbitron — Autonomous Quant Research Agent
 
-> An LLM-powered agent that autonomously discovers, tests, and validates trading signals using the Claude API, walk-forward backtesting, Ledoit-Wolf portfolio optimization, and HMM regime detection.
+> An LLM-powered agent that autonomously discovers, tests, and validates trading signals using function calling (Llama 3.3 70B via Groq), walk-forward backtesting, Ledoit-Wolf portfolio optimization, and HMM regime detection. The LLM chooses what to compute; every number comes from deterministic Python.
 
 ---
 
@@ -17,10 +17,12 @@ Arbitron is a full-stack quantitative research platform combining:
 - **Walk-Forward Backtesting** — Purged and embargoed splits (López de Prado, 2018), quintile L/S portfolio with transaction costs
 - **Portfolio Optimization** — Mean-Variance (SLSQP), Max Sharpe (analytic + SLSQP), Risk Parity (ERC), Ledoit-Wolf covariance shrinkage
 - **Risk Analytics** — VaR/CVaR (historical, parametric, Monte Carlo), factor decomposition, MRC/CRC, Ulcer Index
-- **Regime Detection** — Gaussian HMM on (return, log-vol) features; rule-based fallback (SMA + vol percentile)
-- **ML Return Predictor** — Random Forest with rolling Sharpe / beta / regime features, walk-forward fitting
+- **Regime Detection** — Gaussian HMM on (return, log-vol) features, forward-filtered (no look-ahead); rule-based fallback (SMA + vol percentile)
+- **Trial Registry** — counts every strategy variant tested, so the Deflated Sharpe hurdle reflects the real number of trials
+- **Look-ahead Tests** — changing future prices must not change past factor values, backtest returns or weights; a deliberately cheating factor must be caught
 - **FastAPI Backend** — REST + WebSocket streaming for agent events
-- **React Dashboard** — Agent chat, factor browser, backtest viewer, portfolio optimizer, risk dashboard
+- **Hardened API** — API key that fails closed, explicit CORS origin, per-IP rate limit, bounded agent sessions
+- **React Dashboard** — Agent chat, factor browser, backtest viewer, portfolio optimizer, risk dashboard, research lab
 
 ---
 
@@ -46,34 +48,42 @@ This is designed to avoid the usual student-project trap: picking the prettiest 
 arbitron/
 ├── arbitron/
 │   ├── agent/
-│   │   ├── loop.py         # ArbitronAgent — ReAct loop using Claude tool_use
-│   │   └── tools.py        # 8 tool schemas + executor
+│   │   ├── loop.py         # ArbitronAgent — ReAct loop, OpenAI-compatible function calling (Groq)
+│   │   └── tools.py        # 9 tool schemas + executor
 │   ├── data/
 │   │   └── market.py       # yfinance + Parquet cache, universe definitions
 │   ├── factors/
 │   │   ├── library.py      # 13 factors + FACTOR_REGISTRY
 │   │   └── evaluation.py   # IC, IC-IR, Fama-MacBeth (Newey-West HAC)
 │   ├── backtest/
-│   │   ├── engine.py       # Walk-forward L/S quintile backtest
+│   │   ├── engine.py       # L/S quintile backtest + purged/embargoed walk-forward splitter
 │   │   └── metrics.py      # Sharpe, Sortino, Calmar, CAGR, Omega Ratio, ...
 │   ├── portfolio/
 │   │   └── optimizer.py    # MVO, Max Sharpe, Risk Parity, efficient frontier
 │   ├── risk/
 │   │   └── analytics.py    # VaR, CVaR, MRC, CRC, factor beta, tail metrics
-│   └── models/
-│       ├── regime.py       # GaussianHMM + SimpleRegimeDetector
-│       └── predictor.py    # RandomForest return predictor
+│   ├── lab/
+│   │   ├── research_lab.py        # Research lab: candidates, gates, ranking, memo
+│   │   └── statistical_defense.py # PSR, DSR, PBO (CSCV), drawdown gate
+│   ├── models/
+│   │   ├── regime.py       # GaussianHMM (forward-filtered) + SimpleRegimeDetector
+│   │   └── foundation.py   # Market-state embeddings + walk-forward Ridge adapter
+│   └── trials.py           # Trial registry feeding the Deflated Sharpe hurdle
 ├── api/
 │   ├── main.py             # FastAPI app + WebSocket endpoint
 │   ├── schemas.py          # Pydantic request/response models
-│   └── routers/            # data, factors, backtest, portfolio, risk, agent
+│   ├── security.py         # API key, CORS origin, rate limiting
+│   ├── sessions.py         # Bounded, expiring agent sessions
+│   └── routers/            # data, factors, backtest, portfolio, risk, lab, agent
 ├── frontend/               # React + Vite + Tailwind dashboard
 │   └── src/
-│       ├── pages/          # Agent, Factors, Backtest, Portfolio, Risk
+│       ├── pages/          # Agent, Factors, Backtest, Portfolio, Risk, Lab
 │       ├── api.ts           # Typed API client + WebSocket helper
 │       └── store.ts         # Zustand global state
-├── tests/                  # 84 tests (factors, backtest, portfolio, risk)
+├── tests/                  # 143 tests (factors, backtest, portfolio, risk, lab,
+│                           #   statistical defense, look-ahead, market data)
 ├── research.py             # CLI entry point
+├── render.yaml             # Render deployment (API)
 └── pyproject.toml
 ```
 
@@ -121,9 +131,13 @@ pip install hmmlearn     # optional HMM regime detector
 
 ```bash
 cp .env.example .env
-# Edit .env — add GROQ_API_KEY
-# Get a free key at https://console.groq.com (email signup, no credit card)
+# Edit .env — add GROQ_API_KEY (free key at https://console.groq.com)
 ```
+
+Only the agent needs the Groq key; factors, backtests, the lab and risk tools run without it.
+For a public deployment set `ARBITRON_REQUIRE_API_KEY=true` and `ARBITRON_API_KEY`: the API then
+rejects requests without the `X-API-Key` header, and refuses all requests (503) if no key is configured.
+Every setting is listed in `.env.example`.
 
 ### 3. Run tests
 
@@ -165,7 +179,7 @@ python research.py "Evaluate momentum and reversal factors; backtest the winner"
 
 ## Agent Tools
 
-The agent has access to 8 tools that map directly to the quant library:
+The agent has access to 9 tools that map directly to the quant library:
 
 | Tool | Description |
 |------|-------------|
@@ -209,7 +223,7 @@ The agent has access to 8 tools that map directly to the quant library:
 | `min_variance` | SLSQP | When return estimates are unreliable |
 | `risk_parity` | ERC (Maillard et al., 2010) | Robust, diversified |
 
-All use Ledoit-Wolf shrinkage covariance (sklearn) by default.
+All use Ledoit-Wolf shrinkage covariance (sklearn) by default. Weights are clipped at zero only for long-only books and are always renormalised to sum to 1, so a long-short solution keeps its short leg.
 
 ---
 
@@ -221,6 +235,17 @@ All use Ledoit-Wolf shrinkage covariance (sklearn) by default.
 - **Drawdown analytics**: max duration, average duration, number of drawdown periods
 - **Ulcer Index**: root mean squared drawdown
 - **Tail Ratio**: avg 5th percentile gain / avg 5th percentile loss
+
+---
+
+## Limitations
+
+- **Universes are not point-in-time.** They are today's large caps, so backtests carry survivorship and
+  ex-post selection bias; absolute Sharpe/CAGR are upper bounds. Comparisons between factors on the
+  same universe are much less affected. Every API response that uses a universe carries this caveat.
+- **No strategy is presented as deployable.** The lab's job is to show which candidates fail the
+  statistical gates and why.
+- **Single-process limits.** Rate limiting and the trial registry are per process.
 
 ---
 

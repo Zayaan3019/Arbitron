@@ -22,7 +22,7 @@ import pandas as pd
 
 
 # ---------------------------------------------------------------------------
-# Tool schemas (Claude-compatible format)
+# Tool schemas (OpenAI-compatible function-calling format, as Groq expects)
 # ---------------------------------------------------------------------------
 
 TOOL_SCHEMAS = [
